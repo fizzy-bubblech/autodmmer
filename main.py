@@ -1,68 +1,84 @@
-import os, json
-from typing import List, Dict
-from fastapi import FastAPI, Body
-from pydantic import BaseModel
-from instagrapi import Client
-import redis
+from typing import Optional
+from fastapi import Query, HTTPException
 
-IG_USERNAME = os.getenv("IG_USERNAME")
-IG_PASSWORD = os.getenv("IG_PASSWORD")
-IG_SESSION_ID = os.getenv("IG_SESSION_ID")  # alternatief voor password
-REDIS_URL = os.getenv("REDIS_URL")  # bv. upstash: rediss://:pass@host:port
-SEEN_KEY = os.getenv("SEEN_KEY", "ig_seen_followers")
+# ... bestaande imports/vars/login_client() blijven ongewijzigd ...
 
-r = None
-if REDIS_URL:
-    r = redis.from_url(REDIS_URL, decode_responses=True)
+def _serialize_thread(t):
+    return {
+        "id": t.id,           # string id (instagrapi DirectThread.id)
+        "pk": t.pk,           # numeric pk
+        "users": [{"pk": u.pk, "username": u.username, "full_name": u.full_name} for u in (t.users or [])],
+        "last_message": (
+            {
+                "id": str(t.messages[0].id),
+                "user_id": t.messages[0].user_id,
+                "text": t.messages[0].text,
+                "timestamp": t.messages[0].timestamp.isoformat() if getattr(t.messages[0], "timestamp", None) else None,
+                "item_type": t.messages[0].item_type,
+            } if getattr(t, "messages", None) and len(t.messages) > 0 else None
+        ),
+    }
 
-app = FastAPI()
+def _serialize_message(m):
+    return {
+        "id": str(m.id),
+        "user_id": m.user_id,
+        "thread_id": m.thread_id,
+        "text": m.text,
+        "item_type": m.item_type,
+        "timestamp": m.timestamp.isoformat() if getattr(m, "timestamp", None) else None,
+        "reactions": getattr(m, "reactions", None),
+    }
 
-def login_client() -> Client:
-    cl = Client()
-    if IG_SESSION_ID:
-        cl.login_by_sessionid(IG_SESSION_ID)
-    else:
-        cl.login(IG_USERNAME, IG_PASSWORD)
-    return cl
-
-def load_seen() -> set:
-    if r:
-        return set(map(int, r.smembers(SEEN_KEY) or []))
-    # fallback in-memory (niet persistent op serverless)
-    return set()
-
-def save_seen(ids: set):
-    if r:
-        pipe = r.pipeline()
-        for i in ids:
-            pipe.sadd(SEEN_KEY, int(i))
-        pipe.execute()
-
-@app.get("/poll_followers")
-def poll_followers():
+@app.get("/threads")
+def list_threads(
+    amount: int = 20,
+    selected_filter: str = Query(default="", regex="^$|^flagged$|^unread$"),
+    thread_message_limit: Optional[int] = None
+):
+    """
+    Haal inbox threads op.
+    selected_filter: "", "flagged", "unread"
+    """
     cl = login_client()
-    my_id = cl.user_id_from_username(IG_USERNAME or cl.account_info().username)
-    followers = cl.user_followers_v1(my_id)  # dict {pk(str): UserShort}
-    current_ids = set(map(int, followers.keys()))
-    seen = load_seen()
-    new_ids = current_ids - seen
+    threads = cl.direct_threads(
+        amount=amount,
+        selected_filter=selected_filter,
+        thread_message_limit=thread_message_limit
+    )  # gedocumenteerd in usage guide
+    return {"threads": [_serialize_thread(t) for t in threads], "count": len(threads)}
 
-    new_followers: List[Dict] = []
-    for pk in new_ids:
-        u = followers[str(pk)]
-        new_followers.append({"pk": int(pk), "username": u.username})
-
-    # markeer ALLE huidige als gezien (of alleen new_ids—jouw keuze)
-    save_seen(current_ids)
-
-    return {"new_followers": new_followers, "new_count": len(new_followers)}
-
-class SendBody(BaseModel):
-    pk: int
-    message: str
-
-@app.post("/send_dm")
-def send_dm(payload: SendBody):
+@app.get("/thread/{thread_id}")
+def get_thread(thread_id: int, amount: int = 20):
+    """
+    Haal één thread met tot 'amount' berichten op.
+    """
     cl = login_client()
-    cl.direct_send(payload.message, [int(payload.pk)])
-    return {"ok": True, "sent_to": int(payload.pk)}
+    try:
+        t = cl.direct_thread(thread_id, amount=amount)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Thread not found: {e}")
+    return {
+        "thread": _serialize_thread(t),
+        "messages": [_serialize_message(m) for m in (t.messages or [])]
+    }
+
+@app.get("/messages/{thread_id}")
+def list_messages(thread_id: int, amount: int = 20):
+    """
+    Alleen de berichten van een thread (handig voor paginering).
+    """
+    cl = login_client()
+    msgs = cl.direct_messages(thread_id, amount=amount)
+    return {"messages": [_serialize_message(m) for m in msgs], "count": len(msgs)}
+
+@app.get("/thread_by_participants")
+def thread_by_participants(usernames: str):
+    """
+    Zoek of maak de 1:1 / groeps-thread o.b.v. komma-gescheiden usernames.
+    """
+    cl = login_client()
+    names = [u.strip() for u in usernames.split(",") if u.strip()]
+    user_ids = [cl.user_id_from_username(u) for u in names]
+    t = cl.direct_thread_by_participants(user_ids)  # documented
+    return {"thread": _serialize_thread(t)}
