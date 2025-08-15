@@ -1,3 +1,6 @@
+from fastapi import FastAPI
+app = FastAPI()
+
 # --- ADD: imports & basic store helpers ---
 import os, json, time
 from typing import List, Dict
