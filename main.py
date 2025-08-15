@@ -1,5 +1,6 @@
 # main.py
-import os, json
+import os
+import json
 from typing import List, Dict, Optional
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -24,12 +25,12 @@ SEEN_KEY = os.getenv("SEEN_KEY", "ig_seen_followers")
 SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")  # fallback (ephemeral op Render)
 
 # ---------- Auth / login ----------
-IG_USERNAME = os.getenv("IG_USERNAME")
-IG_PASSWORD = os.getenv("IG_PASSWORD")
-IG_SESSION_ID = os.getenv("IG_SESSION_ID")  # aanbevolen boven password
-
 def login_client() -> Client:
     """Login via session-id of username/password; gooi nette 500 als creds ontbreken."""
+    IG_USERNAME = os.getenv("IG_USERNAME")
+    IG_PASSWORD = os.getenv("IG_PASSWORD")
+    IG_SESSION_ID = os.getenv("IG_SESSION_ID")
+
     cl = Client()
     try:
         if IG_SESSION_ID:
@@ -47,8 +48,11 @@ def _load_seen_ids() -> set:
     if r:
         return set(map(int, r.smembers(SEEN_KEY) or []))
     if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r") as f:
-            return set(json.load(f))
+        try:
+            with open(SEEN_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
     return set()
 
 def _save_seen_ids(ids: set):
@@ -63,7 +67,7 @@ def _save_seen_ids(ids: set):
 
 # ---------- Followers polling core ----------
 def _get_new_followers(cl: Client) -> List[Dict]:
-    me_username = IG_USERNAME or cl.account_info().username
+    me_username = os.getenv("IG_USERNAME") or cl.account_info().username
     my_id = cl.user_id_from_username(me_username)
     followers = cl.user_followers_v1(my_id)  # {pk(str): UserShort}
     current_ids = set(map(int, followers.keys()))
@@ -79,7 +83,8 @@ def _get_new_followers(cl: Client) -> List[Dict]:
             "full_name": getattr(u, "full_name", "") or ""
         })
 
-    _save_seen_ids(current_ids)  # markeer snapshot als gezien
+    # Markeer de hele snapshot als gezien (robuust tegen gemiste runs)
+    _save_seen_ids(current_ids)
     return new_followers
 
 def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, end_m: int) -> bool:
@@ -92,7 +97,8 @@ def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, en
     end = dtime(hour=end_h, minute=end_m)
     if start <= end:
         return start <= now <= end
-    return now >= start or now <= end  # over-midnight
+    # over-midnight
+    return now >= start or now <= end
 
 # ---------- Models ----------
 class ProcessFollowersBody(BaseModel):
@@ -107,14 +113,168 @@ class SendIfNoHistoryBody(BaseModel):
     username: str
     message: str
 
-# ---------- Startup logging ----------
+# ---------- Startup logging (zonder f-strings) ----------
 @app.on_event("startup")
 def _startup_log():
-    print("### STARTUP: main.py loaded")
-    print(f"### STARTUP: Auth via session? {bool(IG_SESSION_ID)} | username set? {bool(IG_USERNAME)}")
     try:
-        # log beschikbare routes
+        print("### STARTUP: main.py loaded")
+        print("### STARTUP: session set? {} | username set? {}".format(bool(os.getenv("IG_SESSION_ID")), bool(os.getenv("IG_USERNAME"))))
         route_paths = [r.path for r in app.routes]
-        print(f"### STARTUP: routes = {route_paths}")
+        print("### STARTUP: routes = {}".format(route_paths))
     except Exception as e:
-        print(f"###
+        print("### STARTUP: route log failed: {}".format(e))
+
+# ---------- Basic & debug ----------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "AutoDMmer API", "ts": datetime.utcnow().isoformat()}
+
+@app.get("/ping")
+def ping():
+    return {"ok": True, "ts": datetime.utcnow().isoformat()}
+
+@app.get("/routes")
+def list_routes():
+    return {"routes": [{"path": r.path, "methods": list(getattr(r, "methods", []))} for r in app.routes]}
+
+@app.get("/debug_login")
+def debug_login():
+    cl = login_client()
+    me = cl.account_info()
+    return {"ok": True, "username": me.username, "pk": me.pk, "full_name": getattr(me, "full_name", "")}
+
+@app.post("/echo")
+async def echo(req: Request):
+    body = None
+    try:
+        if "application/json" in (req.headers.get("content-type") or ""):
+            body = await req.json()
+    except Exception:
+        body = None
+    return {
+        "method": req.method,
+        "path": str(req.url),
+        "headers_subset": {k: v for k, v in req.headers.items() if k.lower() in ["host", "content-type"]},
+        "body": body,
+    }
+
+# ---------- Serializers ----------
+def _serialize_thread(t) -> Dict:
+    return {
+        "id": t.id,
+        "pk": t.pk,
+        "users": [{"pk": u.pk, "username": u.username, "full_name": u.full_name} for u in (t.users or [])],
+        "last_message": (
+            {
+                "id": str(t.messages[0].id),
+                "user_id": t.messages[0].user_id,
+                "text": t.messages[0].text,
+                "timestamp": t.messages[0].timestamp.isoformat() if getattr(t.messages[0], "timestamp", None) else None,
+                "item_type": t.messages[0].item_type,
+            } if getattr(t, "messages", None) and len(t.messages) > 0 else None
+        ),
+    }
+
+def _serialize_message(m) -> Dict:
+    return {
+        "id": str(m.id),
+        "user_id": m.user_id,
+        "thread_id": m.thread_id,
+        "text": m.text,
+        "item_type": m.item_type,
+        "timestamp": m.timestamp.isoformat() if getattr(m, "timestamp", None) else None,
+        "reactions": getattr(m, "reactions", None),
+    }
+
+# ---------- Threads & messages ----------
+@app.get("/threads")
+def list_threads(
+    amount: int = 20,
+    selected_filter: str = Query(default="", description="Allowed: '', 'flagged', 'unread'"),
+    thread_message_limit: Optional[int] = None
+):
+    if selected_filter not in ("", "flagged", "unread"):
+        raise HTTPException(status_code=400, detail="selected_filter must be '', 'flagged', or 'unread'")
+    try:
+        cl = login_client()
+        kwargs = {"amount": amount}
+        if selected_filter:
+            kwargs["selected_filter"] = selected_filter
+        if thread_message_limit is not None:
+            kwargs["thread_message_limit"] = thread_message_limit
+        threads = cl.direct_threads(**kwargs)
+        return {"threads": [_serialize_thread(t) for t in threads], "count": len(threads)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"threads_failed: {e}")
+
+@app.get("/thread/{thread_id}")
+def get_thread(thread_id: str, amount: int = 20):
+    try:
+        cl = login_client()
+        t = cl.direct_thread(thread_id, amount=amount)
+        return {"thread": _serialize_thread(t), "messages": [_serialize_message(m) for m in (t.messages or [])]}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"thread_failed: {e}")
+
+@app.get("/messages/{thread_id}")
+def list_messages(thread_id: str, amount: int = 20):
+    try:
+        cl = login_client()
+        msgs = cl.direct_messages(thread_id, amount=amount)
+        return {"messages": [_serialize_message(m) for m in msgs], "count": len(msgs)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"messages_failed: {e}")
+
+@app.get("/thread_by_participants")
+def thread_by_participants(usernames: str):
+    try:
+        cl = login_client()
+        names = [u.strip() for u in usernames.split(",") if u.strip()]
+        user_ids = [cl.user_id_from_username(u) for u in names]
+        t = cl.direct_thread_by_participants(user_ids)
+        return {"thread": _serialize_thread(t)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"thread_by_participants_failed: {e}")
+
+# ---------- Endpoints die n8n aanroept ----------
+@app.post("/process_new_followers")
+def process_new_followers(payload: ProcessFollowersBody):
+    if payload.time_check:
+        ok = _within_time_window(
+            payload.timezone,
+            payload.start_hour, payload.start_minute,
+            payload.end_hour, payload.end_minute
+        )
+        if not ok:
+            return {"new_followers": [], "new_count": 0, "reason": "outside_time_window"}
+    cl = login_client()
+    new_followers = _get_new_followers(cl)
+    return {"new_followers": new_followers, "new_count": len(new_followers)}
+
+@app.post("/send_dm_if_no_history")
+def send_dm_if_no_history(payload: SendIfNoHistoryBody):
+    cl = login_client()
+    try:
+        user_id = cl.user_id_from_username(payload.username)
+    except Exception as e:
+        return {"sent": False, "reason": f"username_lookup_failed: {e}"}
+    try:
+        threads = cl.direct_threads(amount=50)
+        existing = None
+        for t in threads:
+            if any(getattr(u, "pk", None) == user_id for u in (t.users or [])):
+                existing = t
+                break
+        has_history = False
+        if existing:
+            try:
+                t_full = cl.direct_thread(existing.id, amount=1)
+                has_history = bool(getattr(t_full, "messages", None)) and len(t_full.messages) > 0
+            except Exception:
+                has_history = True
+        if has_history:
+            return {"sent": False, "reason": "history_exists"}
+        cl.direct_send(payload.message, [int(user_id)])
+        return {"sent": True, "to": payload.username}
+    except Exception as e:
+        return {"sent": False, "reason": f"send_failed: {e}"}
