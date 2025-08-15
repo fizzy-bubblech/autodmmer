@@ -1,14 +1,19 @@
-from fastapi import FastAPI
-app = FastAPI()
-
-# --- ADD: imports & basic store helpers ---
-import os, json, time
-from typing import List, Dict
+# main.py
+import os, json
+from typing import List, Dict, Optional
 from datetime import datetime, time as dtime
-from fastapi import Body
-from pydantic import BaseModel
 from zoneinfo import ZoneInfo
 
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+
+# --- External deps ---
+# pip install instagrapi python-dotenv redis
+from instagrapi import Client
+
+app = FastAPI()
+
+# ---------- Optional Redis (persistent "seen" storage) ----------
 try:
     import redis  # optional
     REDIS_URL = os.getenv("REDIS_URL")
@@ -17,8 +22,28 @@ except Exception:
     r = None
 
 SEEN_KEY = os.getenv("SEEN_KEY", "ig_seen_followers")
-SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")
+SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")  # fallback op Render
 
+# ---------- Auth / login ----------
+IG_USERNAME = os.getenv("IG_USERNAME")
+IG_PASSWORD = os.getenv("IG_PASSWORD")
+IG_SESSION_ID = os.getenv("IG_SESSION_ID")  # gebruik dit i.p.v. password als je kan
+
+def login_client() -> Client:
+    """
+    Logt in via session-id of username/password.
+    Gooit 500 als creds ontbreken.
+    """
+    cl = Client()
+    if IG_SESSION_ID:
+        cl.login_by_sessionid(IG_SESSION_ID)
+        return cl
+    if IG_USERNAME and IG_PASSWORD:
+        cl.login(IG_USERNAME, IG_PASSWORD)
+        return cl
+    raise HTTPException(status_code=500, detail="Missing IG credentials: set IG_SESSION_ID or IG_USERNAME+IG_PASSWORD")
+
+# ---------- Helpers: persist "seen followers" ----------
 def _load_seen_ids() -> set:
     if r:
         return set(map(int, r.smembers(SEEN_KEY) or []))
@@ -37,16 +62,16 @@ def _save_seen_ids(ids: set):
         with open(SEEN_FILE, "w") as f:
             json.dump(sorted(list(ids)), f)
 
-# --- ADD: follower polling core ---
-def _get_new_followers(cl) -> List[Dict]:
-    me_username = os.getenv("IG_USERNAME") or cl.account_info().username
+# ---------- Followers polling core ----------
+def _get_new_followers(cl: Client) -> List[Dict]:
+    me_username = IG_USERNAME or cl.account_info().username
     my_id = cl.user_id_from_username(me_username)
     followers = cl.user_followers_v1(my_id)  # {pk(str): UserShort}
     current_ids = set(map(int, followers.keys()))
     seen = _load_seen_ids()
     new_ids = current_ids - seen
 
-    new_followers = []
+    new_followers: List[Dict] = []
     for pk in new_ids:
         u = followers[str(pk)]
         new_followers.append({
@@ -55,7 +80,7 @@ def _get_new_followers(cl) -> List[Dict]:
             "full_name": getattr(u, "full_name", "") or ""
         })
 
-    # Markeer huidige snapshot als gezien (robust tegen missed runs)
+    # Markeer de hele snapshot als gezien (robuust tegen gemiste runs)
     _save_seen_ids(current_ids)
     return new_followers
 
@@ -69,10 +94,10 @@ def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, en
     end = dtime(hour=end_h, minute=end_m)
     if start <= end:
         return start <= now <= end
-    # over-midnight window
+    # over-midnight
     return now >= start or now <= end
 
-# --- ADD: request models ---
+# ---------- Models ----------
 class ProcessFollowersBody(BaseModel):
     time_check: bool = False
     start_hour: int = 0
@@ -85,15 +110,91 @@ class SendIfNoHistoryBody(BaseModel):
     username: str
     message: str
 
-# --- ADD: endpoints expected by n8n ---
+# ---------- (Nice) debug helpers ----------
+@app.get("/ping")
+def ping():
+    return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
+@app.get("/routes")
+def list_routes():
+    return {"routes": [{"path": r.path, "methods": list(getattr(r, "methods", []))} for r in app.routes]}
+
+# ---------- Threads & messages (handig voor testen) ----------
+def _serialize_thread(t) -> Dict:
+    return {
+        "id": t.id,
+        "pk": t.pk,
+        "users": [{"pk": u.pk, "username": u.username, "full_name": u.full_name} for u in (t.users or [])],
+        "last_message": (
+            {
+                "id": str(t.messages[0].id),
+                "user_id": t.messages[0].user_id,
+                "text": t.messages[0].text,
+                "timestamp": t.messages[0].timestamp.isoformat() if getattr(t.messages[0], "timestamp", None) else None,
+                "item_type": t.messages[0].item_type,
+            } if getattr(t, "messages", None) and len(t.messages) > 0 else None
+        ),
+    }
+
+def _serialize_message(m) -> Dict:
+    return {
+        "id": str(m.id),
+        "user_id": m.user_id,
+        "thread_id": m.thread_id,
+        "text": m.text,
+        "item_type": m.item_type,
+        "timestamp": m.timestamp.isoformat() if getattr(m, "timestamp", None) else None,
+        "reactions": getattr(m, "reactions", None),
+    }
+
+@app.get("/threads")
+def list_threads(
+    amount: int = 20,
+    selected_filter: str = Query(default="", description="Allowed: '', 'flagged', 'unread'"),
+    thread_message_limit: Optional[int] = None
+):
+    if selected_filter not in ("", "flagged", "unread"):
+        raise HTTPException(status_code=400, detail="selected_filter must be '', 'flagged', or 'unread'")
+    cl = login_client()
+    kwargs = {"amount": amount}
+    if selected_filter:
+        kwargs["selected_filter"] = selected_filter
+    if thread_message_limit is not None:
+        kwargs["thread_message_limit"] = thread_message_limit
+    threads = cl.direct_threads(**kwargs)
+    return {"threads": [_serialize_thread(t) for t in threads], "count": len(threads)}
+
+@app.get("/thread/{thread_id}")
+def get_thread(thread_id: str, amount: int = 20):
+    cl = login_client()
+    try:
+        t = cl.direct_thread(thread_id, amount=amount)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Thread not found: {e}")
+    return {"thread": _serialize_thread(t), "messages": [_serialize_message(m) for m in (t.messages or [])]}
+
+@app.get("/messages/{thread_id}")
+def list_messages(thread_id: str, amount: int = 20):
+    cl = login_client()
+    msgs = cl.direct_messages(thread_id, amount=amount)
+    return {"messages": [_serialize_message(m) for m in msgs], "count": len(msgs)}
+
+@app.get("/thread_by_participants")
+def thread_by_participants(usernames: str):
+    cl = login_client()
+    names = [u.strip() for u in usernames.split(",") if u.strip()]
+    user_ids = [cl.user_id_from_username(u) for u in names]
+    t = cl.direct_thread_by_participants(user_ids)
+    return {"thread": _serialize_thread(t)}
+
+# ---------- Endpoints die n8n aanroept ----------
 @app.post("/process_new_followers")
 def process_new_followers(payload: ProcessFollowersBody):
     """
-    1) (Optioneel) check time window
-    2) poll followers via user_followers_v1
-    3) diff met seen set (Redis/JSON)
-    4) return: {"new_followers": [...]}
+    1) (Optioneel) time window check
+    2) Poll followers
+    3) Diff vs seen set
+    4) Return nieuwe volgers
     """
     if payload.time_check:
         ok = _within_time_window(
@@ -111,9 +212,7 @@ def process_new_followers(payload: ProcessFollowersBody):
 @app.post("/send_dm_if_no_history")
 def send_dm_if_no_history(payload: SendIfNoHistoryBody):
     """
-    - Check of er al chat history is met deze username.
-    - Alleen DM sturen als er geen history is.
-    - Return {sent: bool, reason: "..."}
+    Check of er history is met deze username; stuur DM alleen als er geen history is.
     """
     cl = login_client()
     try:
@@ -121,30 +220,25 @@ def send_dm_if_no_history(payload: SendIfNoHistoryBody):
     except Exception as e:
         return {"sent": False, "reason": f"username_lookup_failed: {e}"}
 
-    # Probeer bestaande thread te vinden via inbox
     try:
-        threads = cl.direct_threads(amount=50)  # vergroot indien nodig
+        threads = cl.direct_threads(amount=50)
         existing = None
         for t in threads:
-            # t.users is lijst UserShort; vergelijk pk
             if any(getattr(u, "pk", None) == user_id for u in (t.users or [])):
                 existing = t
                 break
 
         has_history = False
         if existing:
-            # Vraag 1 bericht op om te zien of er history is
             try:
                 t_full = cl.direct_thread(existing.id, amount=1)
                 has_history = bool(getattr(t_full, "messages", None)) and len(t_full.messages) > 0
             except Exception:
-                # als ophalen mislukt maar thread bestaat, ga uit van history
                 has_history = True
 
         if has_history:
             return {"sent": False, "reason": "history_exists"}
 
-        # Geen history gevonden: stuur DM
         cl.direct_send(payload.message, [int(user_id)])
         return {"sent": True, "to": payload.username}
 
