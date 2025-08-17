@@ -6,11 +6,12 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# pip install instagrapi python-dotenv redis requests
 from instagrapi import Client
 import requests
+import traceback
 
 app = FastAPI(title="AutoDMmer API")
 
@@ -23,7 +24,7 @@ except Exception:
     r = None
 
 SEEN_KEY = os.getenv("SEEN_KEY", "ig_seen_followers")
-SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")  # fallback (ephemeral op Render)
+SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")  # fallback (ephemeral)
 
 SETTINGS_KEY = os.getenv("SETTINGS_KEY", "ig_settings_json")
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "/tmp/ig_settings.json")
@@ -53,7 +54,7 @@ def _save_seen_ids(ids: set):
         with open(SEEN_FILE, "w") as f:
             json.dump(sorted(list(ids)), f)
 
-# ---------- Helpers: persist instagrapi settings (device, cookies, etc.) ----------
+# ---------- Helpers: persist instagrapi settings ----------
 def _load_ig_settings() -> Optional[dict]:
     try:
         if r:
@@ -101,7 +102,7 @@ def _save_session_override(sessionid: str):
     except Exception:
         pass
 
-# ---------- (Optional) IP-probe, handig voor debugging proxy ----------
+# ---------- IP-probe ----------
 def _probe_public_ip(proxy_url: Optional[str]) -> dict:
     try:
         kw = {}
@@ -112,29 +113,17 @@ def _probe_public_ip(proxy_url: Optional[str]) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- Auth / login met proxy + persistente settings + session override ----------
+# ---------- Auth / login ----------
 def login_client() -> Client:
-    """
-    Login volgorde:
-      1) runtime session override (POST /set_sessionid)
-      2) IG_SESSION_ID (env)
-      3) IG_USERNAME + IG_PASSWORD
-    Met:
-      - IG_PROXY_URL proxy op alle requests
-      - Persistente settings (device, cookies) om challenges te verminderen
-    """
     IG_USERNAME = os.getenv("IG_USERNAME")
     IG_PASSWORD = os.getenv("IG_PASSWORD")
     IG_SESSION_ID = os.getenv("IG_SESSION_ID")
-    IG_PROXY_URL = os.getenv("IG_PROXY_URL")  # bv. http://user:pass@host:port of socks5h://...
+    IG_PROXY_URL = os.getenv("IG_PROXY_URL")
 
     cl = Client()
-
-    # 1) Proxy vroeg zetten
     if IG_PROXY_URL:
         cl.set_proxy(IG_PROXY_URL)
 
-    # 2) Settings laden (device-id e.d.)
     settings = _load_ig_settings()
     if settings:
         try:
@@ -142,7 +131,6 @@ def login_client() -> Client:
         except Exception:
             pass
 
-    # 3) Login
     runtime_session = _load_session_override()
     try:
         if runtime_session:
@@ -153,10 +141,11 @@ def login_client() -> Client:
             cl.login(IG_USERNAME, IG_PASSWORD)
         else:
             raise HTTPException(status_code=500, detail="Missing IG credentials: set IG_SESSION_ID or IG_USERNAME+IG_PASSWORD")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="login_failed: {}".format(e))
 
-    # 4) Succes → settings bewaren
     try:
         _save_ig_settings(cl.get_settings())
     except Exception:
@@ -168,21 +157,63 @@ def login_client() -> Client:
 def _get_new_followers(cl: Client) -> List[Dict]:
     me_username = os.getenv("IG_USERNAME") or cl.account_info().username
     my_id = cl.user_id_from_username(me_username)
-    followers = cl.user_followers_v1(my_id)  # {pk(str): UserShort}
-    current_ids = set(map(int, followers.keys()))
+    followers = cl.user_followers_v1(my_id)  # keys kunnen int óf str zijn, afhankelijk van lib-versie
+
+    # debug-info (klein sample)
+    try:
+        sample_keys = list(followers.keys())[:3]
+        sample_types = [type(k).__name__ for k in sample_keys]
+        print("### followers_map_sample:", sample_keys, sample_types)
+    except Exception:
+        pass
+
+    # normaliseer keys naar int-set
+    try:
+        current_ids = set(int(k) for k in followers.keys())
+    except Exception:
+        # fallback (zou vrijwel nooit nodig moeten zijn)
+        current_ids = set()
+        for k in followers.keys():
+            try:
+                current_ids.add(int(k))
+            except Exception:
+                continue
+
     seen = _load_seen_ids()
     new_ids = current_ids - seen
 
     new_followers: List[Dict] = []
     for pk in new_ids:
-        u = followers[str(pk)]
-        new_followers.append({
-            "pk": int(pk),
-            "username": u.username,
-            "full_name": getattr(u, "full_name", "") or ""
-        })
+        # ROBUSTE LOOKUP: eerst int-key, dan str-key
+        u = followers.get(pk) if isinstance(followers, dict) else None
+        if u is None:
+            u = followers.get(str(pk)) if isinstance(followers, dict) else None
 
-    _save_seen_ids(current_ids)  # markeer snapshot als gezien
+        if u is None:
+            # fallback: 1 user-call (kostbaar, maar beter dan crashen)
+            try:
+                ui = cl.user_info(pk)
+                new_followers.append({
+                    "pk": int(pk),
+                    "username": getattr(ui, "username", None),
+                    "full_name": getattr(ui, "full_name", "") or ""
+                })
+            except Exception as e:
+                print("### WARN: could not enrich follower", pk, "->", repr(e))
+                new_followers.append({
+                    "pk": int(pk),
+                    "username": None,
+                    "full_name": ""
+                })
+        else:
+            new_followers.append({
+                "pk": int(pk),
+                "username": getattr(u, "username", None),
+                "full_name": getattr(u, "full_name", "") or ""
+            })
+
+    # markeer huidige snapshot als gezien
+    _save_seen_ids(current_ids)
     return new_followers
 
 def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, end_m: int) -> bool:
@@ -254,13 +285,10 @@ def proxy_info():
 def debug_login():
     cl = login_client()
     me = cl.account_info()
-    return {"ok": True, "username": me.username, "pk": me.pk, "full_name": getattr(me, "full_name", "")}
+    return {"ok": True, "username": me.username, "pk": str(me.pk), "full_name": getattr(me, "full_name", "")}
 
 @app.post("/set_sessionid")
 def set_sessionid(body: SessionBody):
-    """
-    Zet een runtime sessionid (bewaard in Redis of /tmp). Overschrijft env IG_SESSION_ID.
-    """
     sid = body.sessionid.strip()
     if not sid or len(sid) < 20:
         raise HTTPException(status_code=400, detail="sessionid lijkt ongeldig")
@@ -273,7 +301,18 @@ def whoami_ip():
     via_proxy = _probe_public_ip(os.getenv("IG_PROXY_URL"))
     return {"direct": direct, "via_proxy": via_proxy}
 
-# ---------- Serializers ----------
+@app.get("/debug_followers_keys")
+def debug_followers_keys(limit: int = 5):
+    # helpt vast te stellen of keys int of str zijn
+    cl = login_client()
+    me_username = os.getenv("IG_USERNAME") or cl.account_info().username
+    my_id = cl.user_id_from_username(me_username)
+    followers = cl.user_followers_v1(my_id)
+    sample = list(followers.keys())[:limit]
+    types = [type(k).__name__ for k in sample]
+    return {"count": len(followers), "sample_keys": sample, "key_types": types}
+
+# ---------- Threads & messages ----------
 def _serialize_thread(t) -> Dict:
     return {
         "id": t.id,
@@ -301,7 +340,6 @@ def _serialize_message(m) -> Dict:
         "reactions": getattr(m, "reactions", None),
     }
 
-# ---------- Threads & messages ----------
 @app.get("/threads")
 def list_threads(
     amount: int = 20,
@@ -319,7 +357,10 @@ def list_threads(
             kwargs["thread_message_limit"] = thread_message_limit
         threads = cl.direct_threads(**kwargs)
         return {"threads": [_serialize_thread(t) for t in threads], "count": len(threads)}
+    except HTTPException:
+        raise
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="threads_failed: {}".format(e))
 
 @app.get("/thread/{thread_id}")
@@ -329,6 +370,7 @@ def get_thread(thread_id: str, amount: int = 20):
         t = cl.direct_thread(thread_id, amount=amount)
         return {"thread": _serialize_thread(t), "messages": [_serialize_message(m) for m in (t.messages or [])]}
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=404, detail="thread_failed: {}".format(e))
 
 @app.get("/messages/{thread_id}")
@@ -338,6 +380,7 @@ def list_messages(thread_id: str, amount: int = 20):
         msgs = cl.direct_messages(thread_id, amount=amount)
         return {"messages": [_serialize_message(m) for m in msgs], "count": len(msgs)}
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="messages_failed: {}".format(e))
 
 @app.get("/thread_by_participants")
@@ -349,22 +392,30 @@ def thread_by_participants(usernames: str):
         t = cl.direct_thread_by_participants(user_ids)
         return {"thread": _serialize_thread(t)}
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="thread_by_participants_failed: {}".format(e))
 
 # ---------- Endpoints die n8n aanroept ----------
 @app.post("/process_new_followers")
 def process_new_followers(payload: ProcessFollowersBody):
-    if payload.time_check:
-        ok = _within_time_window(
-            payload.timezone,
-            payload.start_hour, payload.start_minute,
-            payload.end_hour, payload.end_minute
-        )
-        if not ok:
-            return {"new_followers": [], "new_count": 0, "reason": "outside_time_window"}
-    cl = login_client()
-    new_followers = _get_new_followers(cl)
-    return {"new_followers": new_followers, "new_count": len(new_followers)}
+    try:
+        if payload.time_check:
+            ok = _within_time_window(
+                payload.timezone,
+                payload.start_hour, payload.start_minute,
+                payload.end_hour, payload.end_minute
+            )
+            if not ok:
+                return {"new_followers": [], "new_count": 0, "reason": "outside_time_window"}
+
+        cl = login_client()
+        new_followers = _get_new_followers(cl)
+        return {"new_followers": new_followers, "new_count": len(new_followers)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="process_failed: {}".format(e))
 
 @app.post("/send_dm_if_no_history")
 def send_dm_if_no_history(payload: SendIfNoHistoryBody):
@@ -392,4 +443,5 @@ def send_dm_if_no_history(payload: SendIfNoHistoryBody):
         cl.direct_send(payload.message, [int(user_id)])
         return {"sent": True, "to": payload.username}
     except Exception as e:
+        traceback.print_exc()
         return {"sent": False, "reason": "send_failed: {}".format(e)}
