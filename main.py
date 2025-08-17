@@ -1,5 +1,5 @@
 # main.py
-import os, json, traceback, time
+import os, json, traceback, time, random
 from typing import List, Dict, Optional, Iterable, Tuple
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -126,6 +126,13 @@ def login_client() -> Client:
     IG_PROXY_URL = os.getenv("IG_PROXY_URL")
 
     cl = Client()
+    # conservatieve timeouts om “connection closed” te temperen
+    try:
+        cl.timeout = 20
+        cl.request_timeout = 20
+    except Exception:
+        pass
+
     if IG_PROXY_URL:
         cl.set_proxy(IG_PROXY_URL)
 
@@ -170,33 +177,41 @@ TRANSIENT_MARKERS = (
 
 def ig_call(cl: Client, func_name: str, *args, **kwargs):
     """
-    Doe een instagrapi call met 3 pogingen, korte backoff en 1x sessie refresh.
+    Instagrapi-call met 3 pogingen, jittered backoff en 1x sessie-refresh.
+    Logt elke poging met duur en foutsoort.
     """
     last_err = None
     for attempt in range(3):
+        t0 = time.time()
         try:
             fn = getattr(cl, func_name)
-            return fn(*args, **kwargs)
+            res = fn(*args, **kwargs)
+            dt = round((time.time() - t0) * 1000)
+            print(f"### ig_call ok | {func_name} (attempt {attempt+1}) | {dt}ms | args={str(args)[:80]} kwargs={json.dumps(kwargs)[:120]}")
+            return res
         except Exception as e:
+            dt = round((time.time() - t0) * 1000)
             last_err = e
             msg = str(e).lower()
-            # Alleen retry bij duidelijke transient/network throttling fouten
+            print(f"### ig_call fail | {func_name} (attempt {attempt+1}) | {dt}ms | err={e.__class__.__name__}: {e}")
             if any(m in msg for m in TRANSIENT_MARKERS):
-                # 1e misser: probeer sessie te herladen (zonder password)
+                # sessie herladen bij 1e misser
                 if attempt == 0:
                     try:
                         sid = _load_session_override() or os.getenv("IG_SESSION_ID")
                         if sid:
                             cl.login_by_sessionid(sid.strip())
-                    except Exception:
-                        pass
-                time.sleep(1 + 2 * attempt)
+                            print("### ig_call info | session refreshed (by sessionid)")
+                    except Exception as e2:
+                        print(f"### ig_call warn | session refresh failed: {e2}")
+                # jittered backoff
+                time.sleep(1 + attempt + random.random())
                 continue
             break
     # Na retries nog steeds fout:
     raise last_err
 
-# ---------- Followers core ----------
+# ---------- Followers helpers ----------
 def _followers_iter(followers_obj) -> Iterable:
     if isinstance(followers_obj, dict):
         return followers_obj.values()
@@ -227,23 +242,49 @@ def _collect_current_ids_and_map(followers_obj) -> Tuple[set, Dict[int, object]]
             continue
     return current_ids, users_by_pk
 
-def _get_new_followers(cl: Client) -> List[Dict]:
-    me_username = os.getenv("IG_USERNAME") or ig_call(cl, "account_info").username
-    my_id = ig_call(cl, "user_id_from_username", me_username)
-    followers = ig_call(cl, "user_followers_v1", my_id)  # kan dict of list zijn
+def _get_new_followers(cl: Client, diag: Optional[dict] = None) -> List[Dict]:
+    """
+    Zelfde logica maar met optionele 'diag' dict waarin we timings/steps opslaan.
+    """
+    if diag is not None: diag["steps"] = []
 
+    def _step(name, fn, *a, **kw):
+        t0 = time.time()
+        try:
+            out = fn(*a, **kw)
+            if diag is not None:
+                diag["steps"].append({"step": name, "ok": True, "ms": round((time.time()-t0)*1000)})
+            return out
+        except Exception as e:
+            if diag is not None:
+                diag["steps"].append({
+                    "step": name, "ok": False, "ms": round((time.time()-t0)*1000),
+                    "err_type": e.__class__.__name__, "err": str(e)[:300]
+                })
+            raise
+
+    me_username = os.getenv("IG_USERNAME") or _step("account_info", ig_call, cl, "account_info").username
+    my_id = _step("user_id_from_username", ig_call, cl, "user_id_from_username", me_username)
+
+    # Beperk hoeveelheid om heavy requests te vermijden
+    followers = _step(
+        "user_followers_v1",
+        ig_call, cl, "user_followers_v1", my_id,
+        amount=200  # veilig limiten
+    )
+
+    # debug: type + sample
     try:
         typ = type(followers).__name__
-        sample = []
-        if isinstance(followers, dict):
-            sample = list(followers.keys())[:3]
-        elif isinstance(followers, list):
-            sample = [getattr(x, "pk", None) for x in followers[:3]]
-        print("### followers_type:", typ, "| sample:", sample)
+        if diag is not None: diag["followers_type"] = typ
+        print(f"### followers_type={typ}")
     except Exception:
         pass
 
     current_ids, users_by_pk = _collect_current_ids_and_map(followers)
+    if diag is not None:
+        diag["current_count"] = len(current_ids)
+        diag["seen_count_before"] = len(_load_seen_ids())
 
     seen = _load_seen_ids()
     new_ids = current_ids - seen
@@ -253,7 +294,7 @@ def _get_new_followers(cl: Client) -> List[Dict]:
         u = users_by_pk.get(pk)
         if u is None:
             try:
-                ui = ig_call(cl, "user_info", pk)
+                ui = _step("user_info_enrich", ig_call, cl, "user_info", pk)
                 new_followers.append({
                     "pk": int(pk),
                     "username": getattr(ui, "username", None),
@@ -270,6 +311,10 @@ def _get_new_followers(cl: Client) -> List[Dict]:
             })
 
     _save_seen_ids(current_ids)
+    if diag is not None:
+        diag["seen_count_after"] = len(current_ids)
+        diag["new_ids_count"] = len(new_ids)
+
     return new_followers
 
 def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, end_m: int) -> bool:
@@ -362,18 +407,16 @@ def debug_followers_keys(limit: int = 5):
     cl = login_client()
     me_username = os.getenv("IG_USERNAME") or ig_call(cl, "account_info").username
     my_id = ig_call(cl, "user_id_from_username", me_username)
-    followers = ig_call(cl, "user_followers_v1", my_id)
-    info = {"followers_type": type(followers).__name__}
+    followers = ig_call(cl, "user_followers_v1", my_id, amount=200)
+    info = {"followers_type": type(followers).__name__, "count": len(followers) if hasattr(followers, "__len__") else None}
     if isinstance(followers, dict):
         ks = list(followers.keys())[:limit]
         info["sample_keys"] = ks
         info["key_types"] = [type(k).__name__ for k in ks]
-        info["count"] = len(followers)
     elif isinstance(followers, list):
         sample = followers[:limit]
         info["sample_pks"] = [getattr(u, "pk", None) for u in sample]
         info["sample_usernames"] = [getattr(u, "username", None) for u in sample]
-        info["count"] = len(followers)
     else:
         info["repr"] = repr(followers)[:200]
     return info
@@ -471,7 +514,11 @@ class ProcessFollowersBodyIn(BaseModel):
     timezone: str = "UTC"
 
 @app.post("/process_new_followers")
-def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None):
+def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None, verbose: bool = False):
+    """
+    POST /process_new_followers?verbose=1
+    """
+    diag = {} if verbose else None
     try:
         if payload is None:
             payload = ProcessFollowersBodyIn()
@@ -482,15 +529,26 @@ def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None):
                 payload.end_hour, payload.end_minute
             )
             if not ok:
-                return {"new_followers": [], "new_count": 0, "reason": "outside_time_window"}
+                return {"new_followers": [], "new_count": 0, "reason": "outside_time_window", "diag": diag}
+        t0 = time.time()
         cl = login_client()
-        new_followers = _get_new_followers(cl)
-        return {"new_followers": new_followers, "new_count": len(new_followers)}
-    except HTTPException:
+        if diag is not None:
+            diag["login_ms"] = round((time.time() - t0) * 1000)
+        new_followers = _get_new_followers(cl, diag=diag)
+        out = {"new_followers": new_followers, "new_count": len(new_followers)}
+        if diag is not None:
+            out["diag"] = diag
+        return out
+    except HTTPException as he:
+        if diag is not None:
+            return {"detail": he.detail, "diag": diag}
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"process_failed: {e}")
+        detail = f"process_failed: {e}"
+        if diag is not None:
+            return {"detail": detail, "diag": diag}
+        raise HTTPException(status_code=500, detail=detail)
 
 class SendIfNoHistoryBody(BaseModel):
     username: str
