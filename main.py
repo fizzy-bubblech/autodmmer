@@ -1,6 +1,6 @@
 # main.py
 import os, json, traceback
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Iterable, Tuple
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -33,10 +33,8 @@ async def json_errors(request, call_next):
     try:
         return await call_next(request)
     except HTTPException as he:
-        # Laat HTTPException met JSON door
         return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
     except Exception as e:
-        # Log en geef JSON i.p.v. text/plain
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"detail": f"unhandled_error: {e.__class__.__name__}"})
 
@@ -160,37 +158,69 @@ def login_client() -> Client:
     return cl
 
 # ---------- Followers core ----------
+def _followers_iter(followers_obj) -> Iterable:
+    """
+    Normaliseer followers naar een iterator van UserShort-achtige objecten.
+    Ondersteunt dict (pk -> UserShort) én list [UserShort].
+    """
+    if isinstance(followers_obj, dict):
+        return followers_obj.values()
+    if isinstance(followers_obj, list):
+        return iter(followers_obj)
+    # fallback: probeer te itereren
+    try:
+        return iter(followers_obj)
+    except TypeError:
+        return iter([])
+
+def _collect_current_ids_and_map(followers_obj) -> Tuple[set, Dict[int, object]]:
+    current_ids: set = set()
+    users_by_pk: Dict[int, object] = {}
+    for u in _followers_iter(followers_obj):
+        pk = None
+        # pk kan zitten op u.pk of u.id afhankelijk van type
+        for attr in ("pk", "id"):
+            v = getattr(u, attr, None)
+            if v is not None:
+                pk = v
+                break
+        try:
+            if pk is None:
+                continue
+            pk = int(pk)
+            current_ids.add(pk)
+            users_by_pk[pk] = u
+        except Exception:
+            continue
+    return current_ids, users_by_pk
+
 def _get_new_followers(cl: Client) -> List[Dict]:
     me_username = os.getenv("IG_USERNAME") or cl.account_info().username
     my_id = cl.user_id_from_username(me_username)
-    followers = cl.user_followers_v1(my_id)  # dict pk->UserShort (keys kunnen int of str zijn)
+    followers = cl.user_followers_v1(my_id)  # kan dict of list zijn
 
+    # debug: sample type
     try:
-        sample_keys = list(followers.keys())[:3]
-        sample_types = [type(k).__name__ for k in sample_keys]
-        print("### followers_map_sample:", sample_keys, sample_types)
+        typ = type(followers).__name__
+        sample = []
+        if isinstance(followers, dict):
+            sample = list(followers.keys())[:3]
+        elif isinstance(followers, list):
+            sample = [getattr(x, "pk", None) for x in followers[:3]]
+        print("### followers_type:", typ, "| sample:", sample)
     except Exception:
         pass
 
-    try:
-        current_ids = set(int(k) for k in followers.keys())
-    except Exception:
-        current_ids = set()
-        for k in followers.keys():
-            try:
-                current_ids.add(int(k))
-            except Exception:
-                continue
+    current_ids, users_by_pk = _collect_current_ids_and_map(followers)
 
     seen = _load_seen_ids()
     new_ids = current_ids - seen
 
     new_followers: List[Dict] = []
     for pk in new_ids:
-        u = followers.get(pk) if isinstance(followers, dict) else None
+        u = users_by_pk.get(pk)
         if u is None:
-            u = followers.get(str(pk)) if isinstance(followers, dict) else None
-        if u is None:
+            # fallback naar user_info (zwaarder, maar veilig)
             try:
                 ui = cl.user_info(pk)
                 new_followers.append({
@@ -208,6 +238,7 @@ def _get_new_followers(cl: Client) -> List[Dict]:
                 "full_name": getattr(u, "full_name", "") or ""
             })
 
+    # markeer huidige snapshot als gezien
     _save_seen_ids(current_ids)
     return new_followers
 
@@ -302,9 +333,26 @@ def debug_followers_keys(limit: int = 5):
     me_username = os.getenv("IG_USERNAME") or cl.account_info().username
     my_id = cl.user_id_from_username(me_username)
     followers = cl.user_followers_v1(my_id)
-    sample = list(followers.keys())[:limit]
-    types = [type(k).__name__ for k in sample]
-    return {"count": len(followers), "sample_keys": sample, "key_types": types}
+    info = {"followers_type": type(followers).__name__}
+    if isinstance(followers, dict):
+        ks = list(followers.keys())[:limit]
+        info["sample_keys"] = ks
+        info["key_types"] = [type(k).__name__ for k in ks]
+    elif isinstance(followers, list):
+        sample = followers[:limit]
+        info["sample_pks"] = [getattr(u, "pk", None) for u in sample]
+        info["sample_usernames"] = [getattr(u, "username", None) for u in sample]
+    else:
+        info["repr"] = repr(followers)[:200]
+    # ook even het totaal
+    try:
+        if isinstance(followers, dict):
+            info["count"] = len(followers)
+        elif isinstance(followers, list):
+            info["count"] = len(followers)
+    except Exception:
+        pass
+    return info
 
 # ---------- Threads & messages ----------
 def _serialize_thread(t) -> Dict:
@@ -401,10 +449,8 @@ class ProcessFollowersBodyIn(BaseModel):
 @app.post("/process_new_followers")
 def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None):
     try:
-        # body optioneel: defaults
         if payload is None:
             payload = ProcessFollowersBodyIn()
-
         if payload.time_check:
             ok = _within_time_window(
                 payload.timezone,
@@ -413,7 +459,6 @@ def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None):
             )
             if not ok:
                 return {"new_followers": [], "new_count": 0, "reason": "outside_time_window"}
-
         cl = login_client()
         new_followers = _get_new_followers(cl)
         return {"new_followers": new_followers, "new_count": len(new_followers)}
