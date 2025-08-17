@@ -1,21 +1,18 @@
 # main.py
-import os
-import json
+import os, json, traceback
 from typing import List, Dict, Optional
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-
 from instagrapi import Client
 import requests
-import traceback
 
 app = FastAPI(title="AutoDMmer API")
 
-# ---------- Optional Redis (persistent "seen" + settings + session override) ----------
+# ---------- Optional Redis ----------
 try:
     import redis  # optional
     REDIS_URL = os.getenv("REDIS_URL")
@@ -24,15 +21,26 @@ except Exception:
     r = None
 
 SEEN_KEY = os.getenv("SEEN_KEY", "ig_seen_followers")
-SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")  # fallback (ephemeral)
-
+SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")
 SETTINGS_KEY = os.getenv("SETTINGS_KEY", "ig_settings_json")
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "/tmp/ig_settings.json")
-
 SESSION_OVERRIDE_KEY = os.getenv("SESSION_OVERRIDE_KEY", "ig_sessionid_runtime")
 SESSION_FILE = os.getenv("SESSION_FILE", "/tmp/ig_sessionid.txt")
 
-# ---------- Helpers: persist "seen followers" ----------
+# ---------- Global error wrapper: altijd JSON ----------
+@app.middleware("http")
+async def json_errors(request, call_next):
+    try:
+        return await call_next(request)
+    except HTTPException as he:
+        # Laat HTTPException met JSON door
+        return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
+    except Exception as e:
+        # Log en geef JSON i.p.v. text/plain
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"detail": f"unhandled_error: {e.__class__.__name__}"})
+
+# ---------- Seen helpers ----------
 def _load_seen_ids() -> set:
     if r:
         return set(map(int, r.smembers(SEEN_KEY) or []))
@@ -54,7 +62,7 @@ def _save_seen_ids(ids: set):
         with open(SEEN_FILE, "w") as f:
             json.dump(sorted(list(ids)), f)
 
-# ---------- Helpers: persist instagrapi settings ----------
+# ---------- IG settings persist ----------
 def _load_ig_settings() -> Optional[dict]:
     try:
         if r:
@@ -78,7 +86,7 @@ def _save_ig_settings(settings: dict):
     except Exception:
         pass
 
-# ---------- Session override storage ----------
+# ---------- Session override ----------
 def _load_session_override() -> Optional[str]:
     try:
         if r:
@@ -102,7 +110,7 @@ def _save_session_override(sessionid: str):
     except Exception:
         pass
 
-# ---------- IP-probe ----------
+# ---------- Utils ----------
 def _probe_public_ip(proxy_url: Optional[str]) -> dict:
     try:
         kw = {}
@@ -113,7 +121,6 @@ def _probe_public_ip(proxy_url: Optional[str]) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- Auth / login ----------
 def login_client() -> Client:
     IG_USERNAME = os.getenv("IG_USERNAME")
     IG_PASSWORD = os.getenv("IG_PASSWORD")
@@ -144,22 +151,20 @@ def login_client() -> Client:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail="login_failed: {}".format(e))
+        raise HTTPException(status_code=500, detail=f"login_failed: {e}")
 
     try:
         _save_ig_settings(cl.get_settings())
     except Exception:
         pass
-
     return cl
 
-# ---------- Followers polling core ----------
+# ---------- Followers core ----------
 def _get_new_followers(cl: Client) -> List[Dict]:
     me_username = os.getenv("IG_USERNAME") or cl.account_info().username
     my_id = cl.user_id_from_username(me_username)
-    followers = cl.user_followers_v1(my_id)  # keys kunnen int óf str zijn, afhankelijk van lib-versie
+    followers = cl.user_followers_v1(my_id)  # dict pk->UserShort (keys kunnen int of str zijn)
 
-    # debug-info (klein sample)
     try:
         sample_keys = list(followers.keys())[:3]
         sample_types = [type(k).__name__ for k in sample_keys]
@@ -167,11 +172,9 @@ def _get_new_followers(cl: Client) -> List[Dict]:
     except Exception:
         pass
 
-    # normaliseer keys naar int-set
     try:
         current_ids = set(int(k) for k in followers.keys())
     except Exception:
-        # fallback (zou vrijwel nooit nodig moeten zijn)
         current_ids = set()
         for k in followers.keys():
             try:
@@ -184,13 +187,10 @@ def _get_new_followers(cl: Client) -> List[Dict]:
 
     new_followers: List[Dict] = []
     for pk in new_ids:
-        # ROBUSTE LOOKUP: eerst int-key, dan str-key
         u = followers.get(pk) if isinstance(followers, dict) else None
         if u is None:
             u = followers.get(str(pk)) if isinstance(followers, dict) else None
-
         if u is None:
-            # fallback: 1 user-call (kostbaar, maar beter dan crashen)
             try:
                 ui = cl.user_info(pk)
                 new_followers.append({
@@ -199,12 +199,8 @@ def _get_new_followers(cl: Client) -> List[Dict]:
                     "full_name": getattr(ui, "full_name", "") or ""
                 })
             except Exception as e:
-                print("### WARN: could not enrich follower", pk, "->", repr(e))
-                new_followers.append({
-                    "pk": int(pk),
-                    "username": None,
-                    "full_name": ""
-                })
+                print("### WARN enrich follower", pk, "->", repr(e))
+                new_followers.append({"pk": int(pk), "username": None, "full_name": ""})
         else:
             new_followers.append({
                 "pk": int(pk),
@@ -212,7 +208,6 @@ def _get_new_followers(cl: Client) -> List[Dict]:
                 "full_name": getattr(u, "full_name", "") or ""
             })
 
-    # markeer huidige snapshot als gezien
     _save_seen_ids(current_ids)
     return new_followers
 
@@ -226,7 +221,7 @@ def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, en
     end = dtime(hour=end_h, minute=end_m)
     if start <= end:
         return start <= now <= end
-    return now >= start or now <= end  # over-midnight
+    return now >= start or now <= end
 
 # ---------- Models ----------
 class ProcessFollowersBody(BaseModel):
@@ -244,28 +239,28 @@ class SendIfNoHistoryBody(BaseModel):
 class SessionBody(BaseModel):
     sessionid: str
 
-# ---------- Startup logging ----------
+# ---------- Startup logs ----------
 @app.on_event("startup")
 def _startup_log():
     try:
         print("### STARTUP: main.py loaded")
-        print("### STARTUP: session(env) set? {} | username set? {}".format(bool(os.getenv("IG_SESSION_ID")), bool(os.getenv("IG_USERNAME"))))
-        print("### STARTUP: proxy set? {}".format(bool(os.getenv("IG_PROXY_URL"))))
+        print(f"### STARTUP: session(env)? {bool(os.getenv('IG_SESSION_ID'))} | username set? {bool(os.getenv('IG_USERNAME'))}")
+        print(f"### STARTUP: proxy set? {bool(os.getenv('IG_PROXY_URL'))}")
         ip_probe = _probe_public_ip(os.getenv("IG_PROXY_URL"))
-        print("### STARTUP: egress IP probe = {}".format(ip_probe))
+        print(f"### STARTUP: egress IP probe = {ip_probe}")
         route_paths = [r.path for r in app.routes]
-        print("### STARTUP: routes = {}".format(route_paths))
+        print(f"### STARTUP: routes = {route_paths}")
     except Exception as e:
-        print("### STARTUP: route log failed: {}".format(e))
+        print(f"### STARTUP: route log failed: {e}")
 
-# ---------- Basic & debug ----------
+# ---------- Health & debug ----------
 @app.get("/")
 def root():
     return {"ok": True, "service": "AutoDMmer API", "ts": datetime.utcnow().isoformat()}
 
-@app.get("/ping")
-def ping():
-    return {"ok": True, "ts": datetime.utcnow().isoformat()}
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 @app.get("/routes")
 def list_routes():
@@ -303,7 +298,6 @@ def whoami_ip():
 
 @app.get("/debug_followers_keys")
 def debug_followers_keys(limit: int = 5):
-    # helpt vast te stellen of keys int of str zijn
     cl = login_client()
     me_username = os.getenv("IG_USERNAME") or cl.account_info().username
     my_id = cl.user_id_from_username(me_username)
@@ -361,7 +355,7 @@ def list_threads(
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="threads_failed: {}".format(e))
+        raise HTTPException(status_code=500, detail=f"threads_failed: {e}")
 
 @app.get("/thread/{thread_id}")
 def get_thread(thread_id: str, amount: int = 20):
@@ -371,7 +365,7 @@ def get_thread(thread_id: str, amount: int = 20):
         return {"thread": _serialize_thread(t), "messages": [_serialize_message(m) for m in (t.messages or [])]}
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=404, detail="thread_failed: {}".format(e))
+        raise HTTPException(status_code=404, detail=f"thread_failed: {e}")
 
 @app.get("/messages/{thread_id}")
 def list_messages(thread_id: str, amount: int = 20):
@@ -381,7 +375,7 @@ def list_messages(thread_id: str, amount: int = 20):
         return {"messages": [_serialize_message(m) for m in msgs], "count": len(msgs)}
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="messages_failed: {}".format(e))
+        raise HTTPException(status_code=500, detail=f"messages_failed: {e}")
 
 @app.get("/thread_by_participants")
 def thread_by_participants(usernames: str):
@@ -393,12 +387,24 @@ def thread_by_participants(usernames: str):
         return {"thread": _serialize_thread(t)}
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="thread_by_participants_failed: {}".format(e))
+        raise HTTPException(status_code=500, detail=f"thread_by_participants_failed: {e}")
 
-# ---------- Endpoints die n8n aanroept ----------
+# ---------- n8n endpoints ----------
+class ProcessFollowersBodyIn(BaseModel):
+    time_check: bool = False
+    start_hour: int = 0
+    start_minute: int = 0
+    end_hour: int = 23
+    end_minute: int = 59
+    timezone: str = "UTC"
+
 @app.post("/process_new_followers")
-def process_new_followers(payload: ProcessFollowersBody):
+def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None):
     try:
+        # body optioneel: defaults
+        if payload is None:
+            payload = ProcessFollowersBodyIn()
+
         if payload.time_check:
             ok = _within_time_window(
                 payload.timezone,
@@ -415,7 +421,11 @@ def process_new_followers(payload: ProcessFollowersBody):
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="process_failed: {}".format(e))
+        raise HTTPException(status_code=500, detail=f"process_failed: {e}")
+
+class SendIfNoHistoryBody(BaseModel):
+    username: str
+    message: str
 
 @app.post("/send_dm_if_no_history")
 def send_dm_if_no_history(payload: SendIfNoHistoryBody):
@@ -423,7 +433,7 @@ def send_dm_if_no_history(payload: SendIfNoHistoryBody):
     try:
         user_id = cl.user_id_from_username(payload.username)
     except Exception as e:
-        return {"sent": False, "reason": "username_lookup_failed: {}".format(e)}
+        return {"sent": False, "reason": f"username_lookup_failed: {e}"}
     try:
         threads = cl.direct_threads(amount=50)
         existing = None
@@ -444,4 +454,4 @@ def send_dm_if_no_history(payload: SendIfNoHistoryBody):
         return {"sent": True, "to": payload.username}
     except Exception as e:
         traceback.print_exc()
-        return {"sent": False, "reason": "send_failed: {}".format(e)}
+        return {"sent": False, "reason": f"send_failed: {e}"}
