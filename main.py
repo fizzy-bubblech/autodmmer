@@ -27,6 +27,15 @@ SETTINGS_FILE = os.getenv("SETTINGS_FILE", "/tmp/ig_settings.json")
 SESSION_OVERRIDE_KEY = os.getenv("SESSION_OVERRIDE_KEY", "ig_sessionid_runtime")
 SESSION_FILE = os.getenv("SESSION_FILE", "/tmp/ig_sessionid.txt")
 
+# --- Telemetry over seen store backend ---
+LAST_SEEN_BACKEND = "unknown"  # "redis" | "file" | "unknown"
+LAST_SEEN_ERROR: Optional[str] = None
+
+def _set_seen_meta(backend: str, err: Optional[Exception] = None):
+    global LAST_SEEN_BACKEND, LAST_SEEN_ERROR
+    LAST_SEEN_BACKEND = backend
+    LAST_SEEN_ERROR = None if err is None else f"{err.__class__.__name__}: {err}"
+
 # ---------- Global error wrapper: altijd JSON ----------
 @app.middleware("http")
 async def json_errors(request, call_next):
@@ -40,33 +49,74 @@ async def json_errors(request, call_next):
 
 # ---------- Seen helpers ----------
 def _load_seen_ids() -> set:
+    """
+    Lees de set ‘gezien’ follower-IDs.
+    Probeert eerst Redis; bij fout of geen Redis -> file fallback.
+    """
+    # Redis
     if r:
-        return set(map(int, r.smembers(SEEN_KEY) or []))
-    if os.path.exists(SEEN_FILE):
         try:
+            vals = r.smembers(SEEN_KEY) or []
+            out = set(map(int, vals))
+            _set_seen_meta("redis")
+            return out
+        except Exception as e:
+            print("### SEEN redis read failed:", repr(e))
+            _set_seen_meta("redis", e)
+            # fall through naar file
+
+    # File fallback
+    try:
+        if os.path.exists(SEEN_FILE):
             with open(SEEN_FILE, "r") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
+                out = set(json.load(f))
+        else:
+            out = set()
+        _set_seen_meta("file")
+        return out
+    except Exception as e:
+        print("### SEEN file read failed:", repr(e))
+        _set_seen_meta("file", e)
+        return set()
 
 def _save_seen_ids(ids: set):
+    """
+    Sla de huidige snapshot op als ‘gezien’.
+    Eerst Redis; op fout -> file fallback.
+    """
+    # Redis
     if r:
-        pipe = r.pipeline()
-        for i in ids:
-            pipe.sadd(SEEN_KEY, int(i))
-        pipe.execute()
-    else:
+        try:
+            pipe = r.pipeline()
+            for i in ids:
+                pipe.sadd(SEEN_KEY, int(i))
+            pipe.execute()
+            _set_seen_meta("redis")
+            return
+        except Exception as e:
+            print("### SEEN redis write failed:", repr(e))
+            _set_seen_meta("redis", e)
+            # fall through naar file
+
+    # File fallback
+    try:
         with open(SEEN_FILE, "w") as f:
             json.dump(sorted(list(ids)), f)
+        _set_seen_meta("file")
+    except Exception as e:
+        print("### SEEN file write failed:", repr(e))
+        _set_seen_meta("file", e)
 
 # ---------- IG settings persist ----------
 def _load_ig_settings() -> Optional[dict]:
     try:
         if r:
-            raw = r.get(SETTINGS_KEY)
-            if raw:
-                return json.loads(raw)
+            try:
+                raw = r.get(SETTINGS_KEY)
+                if raw:
+                    return json.loads(raw)
+            except Exception as e:
+                print("### SETTINGS redis read failed:", repr(e))
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, "r") as f:
                 return json.load(f)
@@ -77,10 +127,13 @@ def _load_ig_settings() -> Optional[dict]:
 def _save_ig_settings(settings: dict):
     try:
         if r:
-            r.set(SETTINGS_KEY, json.dumps(settings))
-        else:
-            with open(SETTINGS_FILE, "w") as f:
-                json.dump(settings, f)
+            try:
+                r.set(SETTINGS_KEY, json.dumps(settings))
+                return
+            except Exception as e:
+                print("### SETTINGS redis write failed:", repr(e))
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(settings, f)
     except Exception:
         pass
 
@@ -88,9 +141,12 @@ def _save_ig_settings(settings: dict):
 def _load_session_override() -> Optional[str]:
     try:
         if r:
-            val = r.get(SESSION_OVERRIDE_KEY)
-            if val:
-                return val.strip()
+            try:
+                val = r.get(SESSION_OVERRIDE_KEY)
+                if val:
+                    return val.strip()
+            except Exception as e:
+                print("### SESSION redis read failed:", repr(e))
         if os.path.exists(SESSION_FILE):
             with open(SESSION_FILE, "r") as f:
                 return f.read().strip()
@@ -101,10 +157,13 @@ def _load_session_override() -> Optional[str]:
 def _save_session_override(sessionid: str):
     try:
         if r:
-            r.set(SESSION_OVERRIDE_KEY, sessionid.strip())
-        else:
-            with open(SESSION_FILE, "w") as f:
-                f.write(sessionid.strip())
+            try:
+                r.set(SESSION_OVERRIDE_KEY, sessionid.strip())
+                return
+            except Exception as e:
+                print("### SESSION redis write failed:", repr(e))
+        with open(SESSION_FILE, "w") as f:
+            f.write(sessionid.strip())
     except Exception:
         pass
 
@@ -126,7 +185,7 @@ def login_client() -> Client:
     IG_PROXY_URL = os.getenv("IG_PROXY_URL")
 
     cl = Client()
-    # conservatieve timeouts om “connection closed” te temperen
+    # iets hogere timeouts
     try:
         cl.timeout = 20
         cl.request_timeout = 20
@@ -208,7 +267,6 @@ def ig_call(cl: Client, func_name: str, *args, **kwargs):
                 time.sleep(1 + attempt + random.random())
                 continue
             break
-    # Na retries nog steeds fout:
     raise last_err
 
 # ---------- Followers helpers ----------
@@ -243,9 +301,6 @@ def _collect_current_ids_and_map(followers_obj) -> Tuple[set, Dict[int, object]]
     return current_ids, users_by_pk
 
 def _get_new_followers(cl: Client, diag: Optional[dict] = None) -> List[Dict]:
-    """
-    Zelfde logica maar met optionele 'diag' dict waarin we timings/steps opslaan.
-    """
     if diag is not None: diag["steps"] = []
 
     def _step(name, fn, *a, **kw):
@@ -266,27 +321,27 @@ def _get_new_followers(cl: Client, diag: Optional[dict] = None) -> List[Dict]:
     me_username = os.getenv("IG_USERNAME") or _step("account_info", ig_call, cl, "account_info").username
     my_id = _step("user_id_from_username", ig_call, cl, "user_id_from_username", me_username)
 
-    # Beperk hoeveelheid om heavy requests te vermijden
-    followers = _step(
-        "user_followers_v1",
-        ig_call, cl, "user_followers_v1", my_id,
-        amount=200  # veilig limiten
-    )
-
-    # debug: type + sample
+    followers = _step("user_followers_v1", ig_call, cl, "user_followers_v1", my_id, amount=200)
     try:
         typ = type(followers).__name__
         if diag is not None: diag["followers_type"] = typ
-        print(f"### followers_type={typ}")
     except Exception:
         pass
 
     current_ids, users_by_pk = _collect_current_ids_and_map(followers)
     if diag is not None:
         diag["current_count"] = len(current_ids)
-        diag["seen_count_before"] = len(_load_seen_ids())
 
+    # SEEN READ (safe)
+    seen_read_t0 = time.time()
     seen = _load_seen_ids()
+    seen_read_ms = round((time.time() - seen_read_t0) * 1000)
+    if diag is not None:
+        diag["seen_backend_before"] = LAST_SEEN_BACKEND
+        diag["seen_error_before"] = LAST_SEEN_ERROR
+        diag["seen_count_before"] = len(seen)
+        diag["seen_read_ms"] = seen_read_ms
+
     new_ids = current_ids - seen
 
     new_followers: List[Dict] = []
@@ -310,9 +365,14 @@ def _get_new_followers(cl: Client, diag: Optional[dict] = None) -> List[Dict]:
                 "full_name": getattr(u, "full_name", "") or ""
             })
 
+    # SEEN WRITE (safe)
+    seen_write_t0 = time.time()
     _save_seen_ids(current_ids)
+    seen_write_ms = round((time.time() - seen_write_t0) * 1000)
     if diag is not None:
-        diag["seen_count_after"] = len(current_ids)
+        diag["seen_backend_after"] = LAST_SEEN_BACKEND
+        diag["seen_error_after"] = LAST_SEEN_ERROR
+        diag["seen_write_ms"] = seen_write_ms
         diag["new_ids_count"] = len(new_ids)
 
     return new_followers
@@ -401,6 +461,10 @@ def whoami_ip():
     direct = _probe_public_ip(None)
     via_proxy = _probe_public_ip(os.getenv("IG_PROXY_URL"))
     return {"direct": direct, "via_proxy": via_proxy}
+
+@app.get("/seen_status")
+def seen_status():
+    return {"backend": LAST_SEEN_BACKEND, "last_error": LAST_SEEN_ERROR}
 
 @app.get("/debug_followers_keys")
 def debug_followers_keys(limit: int = 5):
@@ -541,14 +605,16 @@ def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None, verb
         return out
     except HTTPException as he:
         if diag is not None:
-            return {"detail": he.detail, "diag": diag}
+            return {"detail": he.detail, "diag": diag, "seen_status": {"backend": LAST_SEEN_BACKEND, "last_error": LAST_SEEN_ERROR}}
         raise
     except Exception as e:
         traceback.print_exc()
         detail = f"process_failed: {e}"
+        out = {"detail": detail}
         if diag is not None:
-            return {"detail": detail, "diag": diag}
-        raise HTTPException(status_code=500, detail=detail)
+            out["diag"] = diag
+        out["seen_status"] = {"backend": LAST_SEEN_BACKEND, "last_error": LAST_SEEN_ERROR}
+        return JSONResponse(status_code=500, content=out)
 
 class SendIfNoHistoryBody(BaseModel):
     username: str
