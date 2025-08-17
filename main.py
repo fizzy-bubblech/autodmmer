@@ -1,5 +1,5 @@
 # main.py
-import os, json, traceback
+import os, json, traceback, time
 from typing import List, Dict, Optional, Iterable, Tuple
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -157,17 +157,51 @@ def login_client() -> Client:
         pass
     return cl
 
+# ---------- Robust IG-call wrapper ----------
+TRANSIENT_MARKERS = (
+    "connection closed by server",
+    "temporarily blocked",
+    "please wait a few minutes",
+    "timed out",
+    "read timed out",
+    "max retries exceeded",
+    "connection reset",
+)
+
+def ig_call(cl: Client, func_name: str, *args, **kwargs):
+    """
+    Doe een instagrapi call met 3 pogingen, korte backoff en 1x sessie refresh.
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            fn = getattr(cl, func_name)
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            # Alleen retry bij duidelijke transient/network throttling fouten
+            if any(m in msg for m in TRANSIENT_MARKERS):
+                # 1e misser: probeer sessie te herladen (zonder password)
+                if attempt == 0:
+                    try:
+                        sid = _load_session_override() or os.getenv("IG_SESSION_ID")
+                        if sid:
+                            cl.login_by_sessionid(sid.strip())
+                    except Exception:
+                        pass
+                time.sleep(1 + 2 * attempt)
+                continue
+            break
+    # Na retries nog steeds fout:
+    raise last_err
+
 # ---------- Followers core ----------
 def _followers_iter(followers_obj) -> Iterable:
-    """
-    Normaliseer followers naar een iterator van UserShort-achtige objecten.
-    Ondersteunt dict (pk -> UserShort) én list [UserShort].
-    """
     if isinstance(followers_obj, dict):
         return followers_obj.values()
     if isinstance(followers_obj, list):
         return iter(followers_obj)
-    # fallback: probeer te itereren
     try:
         return iter(followers_obj)
     except TypeError:
@@ -178,7 +212,6 @@ def _collect_current_ids_and_map(followers_obj) -> Tuple[set, Dict[int, object]]
     users_by_pk: Dict[int, object] = {}
     for u in _followers_iter(followers_obj):
         pk = None
-        # pk kan zitten op u.pk of u.id afhankelijk van type
         for attr in ("pk", "id"):
             v = getattr(u, attr, None)
             if v is not None:
@@ -195,11 +228,10 @@ def _collect_current_ids_and_map(followers_obj) -> Tuple[set, Dict[int, object]]
     return current_ids, users_by_pk
 
 def _get_new_followers(cl: Client) -> List[Dict]:
-    me_username = os.getenv("IG_USERNAME") or cl.account_info().username
-    my_id = cl.user_id_from_username(me_username)
-    followers = cl.user_followers_v1(my_id)  # kan dict of list zijn
+    me_username = os.getenv("IG_USERNAME") or ig_call(cl, "account_info").username
+    my_id = ig_call(cl, "user_id_from_username", me_username)
+    followers = ig_call(cl, "user_followers_v1", my_id)  # kan dict of list zijn
 
-    # debug: sample type
     try:
         typ = type(followers).__name__
         sample = []
@@ -220,9 +252,8 @@ def _get_new_followers(cl: Client) -> List[Dict]:
     for pk in new_ids:
         u = users_by_pk.get(pk)
         if u is None:
-            # fallback naar user_info (zwaarder, maar veilig)
             try:
-                ui = cl.user_info(pk)
+                ui = ig_call(cl, "user_info", pk)
                 new_followers.append({
                     "pk": int(pk),
                     "username": getattr(ui, "username", None),
@@ -238,7 +269,6 @@ def _get_new_followers(cl: Client) -> List[Dict]:
                 "full_name": getattr(u, "full_name", "") or ""
             })
 
-    # markeer huidige snapshot als gezien
     _save_seen_ids(current_ids)
     return new_followers
 
@@ -310,7 +340,7 @@ def proxy_info():
 @app.get("/debug_login")
 def debug_login():
     cl = login_client()
-    me = cl.account_info()
+    me = ig_call(cl, "account_info")
     return {"ok": True, "username": me.username, "pk": str(me.pk), "full_name": getattr(me, "full_name", "")}
 
 @app.post("/set_sessionid")
@@ -330,28 +360,22 @@ def whoami_ip():
 @app.get("/debug_followers_keys")
 def debug_followers_keys(limit: int = 5):
     cl = login_client()
-    me_username = os.getenv("IG_USERNAME") or cl.account_info().username
-    my_id = cl.user_id_from_username(me_username)
-    followers = cl.user_followers_v1(my_id)
+    me_username = os.getenv("IG_USERNAME") or ig_call(cl, "account_info").username
+    my_id = ig_call(cl, "user_id_from_username", me_username)
+    followers = ig_call(cl, "user_followers_v1", my_id)
     info = {"followers_type": type(followers).__name__}
     if isinstance(followers, dict):
         ks = list(followers.keys())[:limit]
         info["sample_keys"] = ks
         info["key_types"] = [type(k).__name__ for k in ks]
+        info["count"] = len(followers)
     elif isinstance(followers, list):
         sample = followers[:limit]
         info["sample_pks"] = [getattr(u, "pk", None) for u in sample]
         info["sample_usernames"] = [getattr(u, "username", None) for u in sample]
+        info["count"] = len(followers)
     else:
         info["repr"] = repr(followers)[:200]
-    # ook even het totaal
-    try:
-        if isinstance(followers, dict):
-            info["count"] = len(followers)
-        elif isinstance(followers, list):
-            info["count"] = len(followers)
-    except Exception:
-        pass
     return info
 
 # ---------- Threads & messages ----------
@@ -397,7 +421,7 @@ def list_threads(
             kwargs["selected_filter"] = selected_filter
         if thread_message_limit is not None:
             kwargs["thread_message_limit"] = thread_message_limit
-        threads = cl.direct_threads(**kwargs)
+        threads = ig_call(cl, "direct_threads", **kwargs)
         return {"threads": [_serialize_thread(t) for t in threads], "count": len(threads)}
     except HTTPException:
         raise
@@ -409,7 +433,7 @@ def list_threads(
 def get_thread(thread_id: str, amount: int = 20):
     try:
         cl = login_client()
-        t = cl.direct_thread(thread_id, amount=amount)
+        t = ig_call(cl, "direct_thread", thread_id, amount=amount)
         return {"thread": _serialize_thread(t), "messages": [_serialize_message(m) for m in (t.messages or [])]}
     except Exception as e:
         traceback.print_exc()
@@ -419,7 +443,7 @@ def get_thread(thread_id: str, amount: int = 20):
 def list_messages(thread_id: str, amount: int = 20):
     try:
         cl = login_client()
-        msgs = cl.direct_messages(thread_id, amount=amount)
+        msgs = ig_call(cl, "direct_messages", thread_id, amount=amount)
         return {"messages": [_serialize_message(m) for m in msgs], "count": len(msgs)}
     except Exception as e:
         traceback.print_exc()
@@ -430,8 +454,8 @@ def thread_by_participants(usernames: str):
     try:
         cl = login_client()
         names = [u.strip() for u in usernames.split(",") if u.strip()]
-        user_ids = [cl.user_id_from_username(u) for u in names]
-        t = cl.direct_thread_by_participants(user_ids)
+        user_ids = [ig_call(cl, "user_id_from_username", u) for u in names]
+        t = ig_call(cl, "direct_thread_by_participants", user_ids)
         return {"thread": _serialize_thread(t)}
     except Exception as e:
         traceback.print_exc()
@@ -476,11 +500,11 @@ class SendIfNoHistoryBody(BaseModel):
 def send_dm_if_no_history(payload: SendIfNoHistoryBody):
     cl = login_client()
     try:
-        user_id = cl.user_id_from_username(payload.username)
+        user_id = ig_call(cl, "user_id_from_username", payload.username)
     except Exception as e:
         return {"sent": False, "reason": f"username_lookup_failed: {e}"}
     try:
-        threads = cl.direct_threads(amount=50)
+        threads = ig_call(cl, "direct_threads", amount=50)
         existing = None
         for t in threads:
             if any(getattr(u, "pk", None) == user_id for u in (t.users or [])):
@@ -489,13 +513,13 @@ def send_dm_if_no_history(payload: SendIfNoHistoryBody):
         has_history = False
         if existing:
             try:
-                t_full = cl.direct_thread(existing.id, amount=1)
+                t_full = ig_call(cl, "direct_thread", existing.id, amount=1)
                 has_history = bool(getattr(t_full, "messages", None)) and len(t_full.messages) > 0
             except Exception:
                 has_history = True
         if has_history:
             return {"sent": False, "reason": "history_exists"}
-        cl.direct_send(payload.message, [int(user_id)])
+        ig_call(cl, "direct_send", payload.message, [int(user_id)])
         return {"sent": True, "to": payload.username}
     except Exception as e:
         traceback.print_exc()
