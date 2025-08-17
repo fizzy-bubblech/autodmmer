@@ -8,12 +8,13 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 
-# pip install instagrapi python-dotenv redis
+# pip install instagrapi python-dotenv redis requests
 from instagrapi import Client
+import requests
 
 app = FastAPI(title="AutoDMmer API")
 
-# ---------- Optional Redis (persistent "seen" storage) ----------
+# ---------- Optional Redis (persistent "seen" + settings) ----------
 try:
     import redis  # optional
     REDIS_URL = os.getenv("REDIS_URL")
@@ -24,24 +25,8 @@ except Exception:
 SEEN_KEY = os.getenv("SEEN_KEY", "ig_seen_followers")
 SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")  # fallback (ephemeral op Render)
 
-# ---------- Auth / login ----------
-def login_client() -> Client:
-    """Login via session-id of username/password; gooi nette 500 als creds ontbreken."""
-    IG_USERNAME = os.getenv("IG_USERNAME")
-    IG_PASSWORD = os.getenv("IG_PASSWORD")
-    IG_SESSION_ID = os.getenv("IG_SESSION_ID")
-
-    cl = Client()
-    try:
-        if IG_SESSION_ID:
-            cl.login_by_sessionid(IG_SESSION_ID)
-            return cl
-        if IG_USERNAME and IG_PASSWORD:
-            cl.login(IG_USERNAME, IG_PASSWORD)
-            return cl
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"login_failed: {e}")
-    raise HTTPException(status_code=500, detail="Missing IG credentials: set IG_SESSION_ID or IG_USERNAME+IG_PASSWORD")
+SETTINGS_KEY = os.getenv("SETTINGS_KEY", "ig_settings_json")
+SETTINGS_FILE = os.getenv("SETTINGS_FILE", "/tmp/ig_settings.json")
 
 # ---------- Helpers: persist "seen followers" ----------
 def _load_seen_ids() -> set:
@@ -65,6 +50,87 @@ def _save_seen_ids(ids: set):
         with open(SEEN_FILE, "w") as f:
             json.dump(sorted(list(ids)), f)
 
+# ---------- Helpers: persist instagrapi settings (device, cookies, etc.) ----------
+def _load_ig_settings() -> Optional[dict]:
+    try:
+        if r:
+            raw = r.get(SETTINGS_KEY)
+            if raw:
+                return json.loads(raw)
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        return None
+    return None
+
+def _save_ig_settings(settings: dict):
+    try:
+        if r:
+            r.set(SETTINGS_KEY, json.dumps(settings))
+        else:
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(settings, f)
+    except Exception:
+        pass
+
+# ---------- (Optional) IP-probe, handig voor debugging proxy ----------
+def _probe_public_ip(proxy_url: Optional[str]) -> dict:
+    try:
+        kw = {}
+        if proxy_url:
+            kw["proxies"] = {"http": proxy_url, "https": proxy_url}
+        resp = requests.get("https://api.ipify.org?format=json", timeout=8, **kw)
+        return {"ok": True, "ip": resp.json().get("ip")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ---------- Auth / login met proxy + persistente settings ----------
+def login_client() -> Client:
+    """
+    Login via session-id of username/password.
+    - Gebruikt IG_PROXY_URL als proxy
+    - Laadt en bewaart instagrapi settings (device, cookies)
+    """
+    IG_USERNAME = os.getenv("IG_USERNAME")
+    IG_PASSWORD = os.getenv("IG_PASSWORD")
+    IG_SESSION_ID = os.getenv("IG_SESSION_ID")
+    IG_PROXY_URL = os.getenv("IG_PROXY_URL")  # bv. http://user:pass@host:port of socks5h://user:pass@host:port
+
+    cl = Client()
+
+    # 1) Proxy zetten (zo vroeg mogelijk)
+    if IG_PROXY_URL:
+        cl.set_proxy(IG_PROXY_URL)
+
+    # 2) Bestaande settings laden (device ids e.d.)
+    settings = _load_ig_settings()
+    if settings:
+        try:
+            cl.set_settings(settings)
+        except Exception:
+            # als oude settings corrupt zijn, negeren en vers beginnen
+            pass
+
+    # 3) Probeer inloggen
+    try:
+        if IG_SESSION_ID:
+            cl.login_by_sessionid(IG_SESSION_ID)
+        elif IG_USERNAME and IG_PASSWORD:
+            cl.login(IG_USERNAME, IG_PASSWORD)
+        else:
+            raise HTTPException(status_code=500, detail="Missing IG credentials: set IG_SESSION_ID or IG_USERNAME+IG_PASSWORD")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="login_failed: {}".format(e))
+
+    # 4) Succesvolle login → settings bewaren
+    try:
+        _save_ig_settings(cl.get_settings())
+    except Exception:
+        pass
+
+    return cl
+
 # ---------- Followers polling core ----------
 def _get_new_followers(cl: Client) -> List[Dict]:
     me_username = os.getenv("IG_USERNAME") or cl.account_info().username
@@ -83,8 +149,7 @@ def _get_new_followers(cl: Client) -> List[Dict]:
             "full_name": getattr(u, "full_name", "") or ""
         })
 
-    # Markeer de hele snapshot als gezien (robuust tegen gemiste runs)
-    _save_seen_ids(current_ids)
+    _save_seen_ids(current_ids)  # markeer snapshot als gezien
     return new_followers
 
 def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, end_m: int) -> bool:
@@ -97,8 +162,7 @@ def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, en
     end = dtime(hour=end_h, minute=end_m)
     if start <= end:
         return start <= now <= end
-    # over-midnight
-    return now >= start or now <= end
+    return now >= start or now <= end  # over-midnight
 
 # ---------- Models ----------
 class ProcessFollowersBody(BaseModel):
@@ -113,12 +177,15 @@ class SendIfNoHistoryBody(BaseModel):
     username: str
     message: str
 
-# ---------- Startup logging (zonder f-strings) ----------
+# ---------- Startup logging ----------
 @app.on_event("startup")
 def _startup_log():
     try:
         print("### STARTUP: main.py loaded")
         print("### STARTUP: session set? {} | username set? {}".format(bool(os.getenv("IG_SESSION_ID")), bool(os.getenv("IG_USERNAME"))))
+        print("### STARTUP: proxy set? {}".format(bool(os.getenv("IG_PROXY_URL"))))
+        ip_probe = _probe_public_ip(os.getenv("IG_PROXY_URL"))
+        print("### STARTUP: egress IP probe = {}".format(ip_probe))
         route_paths = [r.path for r in app.routes]
         print("### STARTUP: routes = {}".format(route_paths))
     except Exception as e:
@@ -143,20 +210,12 @@ def debug_login():
     me = cl.account_info()
     return {"ok": True, "username": me.username, "pk": me.pk, "full_name": getattr(me, "full_name", "")}
 
-@app.post("/echo")
-async def echo(req: Request):
-    body = None
-    try:
-        if "application/json" in (req.headers.get("content-type") or ""):
-            body = await req.json()
-    except Exception:
-        body = None
-    return {
-        "method": req.method,
-        "path": str(req.url),
-        "headers_subset": {k: v for k, v in req.headers.items() if k.lower() in ["host", "content-type"]},
-        "body": body,
-    }
+@app.get("/whoami_ip")
+def whoami_ip():
+    """Check je publieke IP, met of zonder proxy (voor debugging)."""
+    direct = _probe_public_ip(None)
+    via_proxy = _probe_public_ip(os.getenv("IG_PROXY_URL"))
+    return {"direct": direct, "via_proxy": via_proxy}
 
 # ---------- Serializers ----------
 def _serialize_thread(t) -> Dict:
@@ -205,7 +264,7 @@ def list_threads(
         threads = cl.direct_threads(**kwargs)
         return {"threads": [_serialize_thread(t) for t in threads], "count": len(threads)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"threads_failed: {e}")
+        raise HTTPException(status_code=500, detail="threads_failed: {}".format(e))
 
 @app.get("/thread/{thread_id}")
 def get_thread(thread_id: str, amount: int = 20):
@@ -214,7 +273,7 @@ def get_thread(thread_id: str, amount: int = 20):
         t = cl.direct_thread(thread_id, amount=amount)
         return {"thread": _serialize_thread(t), "messages": [_serialize_message(m) for m in (t.messages or [])]}
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"thread_failed: {e}")
+        raise HTTPException(status_code=404, detail="thread_failed: {}".format(e))
 
 @app.get("/messages/{thread_id}")
 def list_messages(thread_id: str, amount: int = 20):
@@ -223,7 +282,7 @@ def list_messages(thread_id: str, amount: int = 20):
         msgs = cl.direct_messages(thread_id, amount=amount)
         return {"messages": [_serialize_message(m) for m in msgs], "count": len(msgs)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"messages_failed: {e}")
+        raise HTTPException(status_code=500, detail="messages_failed: {}".format(e))
 
 @app.get("/thread_by_participants")
 def thread_by_participants(usernames: str):
@@ -234,9 +293,21 @@ def thread_by_participants(usernames: str):
         t = cl.direct_thread_by_participants(user_ids)
         return {"thread": _serialize_thread(t)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"thread_by_participants_failed: {e}")
+        raise HTTPException(status_code=500, detail="thread_by_participants_failed: {}".format(e))
 
 # ---------- Endpoints die n8n aanroept ----------
+class ProcessFollowersBody(BaseModel):
+    time_check: bool = False
+    start_hour: int = 0
+    start_minute: int = 0
+    end_hour: int = 23
+    end_minute: int = 59
+    timezone: str = "UTC"
+
+class SendIfNoHistoryBody(BaseModel):
+    username: str
+    message: str
+
 @app.post("/process_new_followers")
 def process_new_followers(payload: ProcessFollowersBody):
     if payload.time_check:
@@ -257,7 +328,7 @@ def send_dm_if_no_history(payload: SendIfNoHistoryBody):
     try:
         user_id = cl.user_id_from_username(payload.username)
     except Exception as e:
-        return {"sent": False, "reason": f"username_lookup_failed: {e}"}
+        return {"sent": False, "reason": "username_lookup_failed: {}".format(e)}
     try:
         threads = cl.direct_threads(amount=50)
         existing = None
@@ -277,4 +348,4 @@ def send_dm_if_no_history(payload: SendIfNoHistoryBody):
         cl.direct_send(payload.message, [int(user_id)])
         return {"sent": True, "to": payload.username}
     except Exception as e:
-        return {"sent": False, "reason": f"send_failed: {e}"}
+        return {"sent": False, "reason": "send_failed: {}".format(e)}
