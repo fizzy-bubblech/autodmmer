@@ -34,7 +34,7 @@ LAST_SEEN_ERROR: Optional[str] = None
 def _set_seen_meta(backend: str, err: Optional[Exception] = None):
     global LAST_SEEN_BACKEND, LAST_SEEN_ERROR
     LAST_SEEN_BACKEND = backend
-    LAST_SEEN_ERROR = None if err is None else f"{err.__class__.__name__}: {err}"
+    LAST_SEEN_ERROR = None if err is None else f"{e.__class__.__name__}: {e}" if (e:=err) else None
 
 # ---------- Global error wrapper: altijd JSON ----------
 @app.middleware("http")
@@ -49,10 +49,6 @@ async def json_errors(request, call_next):
 
 # ---------- Seen helpers ----------
 def _load_seen_ids() -> set:
-    """
-    Lees de set ‘gezien’ follower-IDs.
-    Probeert eerst Redis; bij fout of geen Redis -> file fallback.
-    """
     # Redis
     if r:
         try:
@@ -63,8 +59,6 @@ def _load_seen_ids() -> set:
         except Exception as e:
             print("### SEEN redis read failed:", repr(e))
             _set_seen_meta("redis", e)
-            # fall through naar file
-
     # File fallback
     try:
         if os.path.exists(SEEN_FILE):
@@ -80,10 +74,6 @@ def _load_seen_ids() -> set:
         return set()
 
 def _save_seen_ids(ids: set):
-    """
-    Sla de huidige snapshot op als ‘gezien’.
-    Eerst Redis; op fout -> file fallback.
-    """
     # Redis
     if r:
         try:
@@ -96,8 +86,6 @@ def _save_seen_ids(ids: set):
         except Exception as e:
             print("### SEEN redis write failed:", repr(e))
             _set_seen_meta("redis", e)
-            # fall through naar file
-
     # File fallback
     try:
         with open(SEEN_FILE, "w") as f:
@@ -185,13 +173,11 @@ def login_client() -> Client:
     IG_PROXY_URL = os.getenv("IG_PROXY_URL")
 
     cl = Client()
-    # iets hogere timeouts
     try:
         cl.timeout = 20
         cl.request_timeout = 20
     except Exception:
         pass
-
     if IG_PROXY_URL:
         cl.set_proxy(IG_PROXY_URL)
 
@@ -235,10 +221,6 @@ TRANSIENT_MARKERS = (
 )
 
 def ig_call(cl: Client, func_name: str, *args, **kwargs):
-    """
-    Instagrapi-call met 3 pogingen, jittered backoff en 1x sessie-refresh.
-    Logt elke poging met duur en foutsoort.
-    """
     last_err = None
     for attempt in range(3):
         t0 = time.time()
@@ -254,7 +236,6 @@ def ig_call(cl: Client, func_name: str, *args, **kwargs):
             msg = str(e).lower()
             print(f"### ig_call fail | {func_name} (attempt {attempt+1}) | {dt}ms | err={e.__class__.__name__}: {e}")
             if any(m in msg for m in TRANSIENT_MARKERS):
-                # sessie herladen bij 1e misser
                 if attempt == 0:
                     try:
                         sid = _load_session_override() or os.getenv("IG_SESSION_ID")
@@ -263,7 +244,6 @@ def ig_call(cl: Client, func_name: str, *args, **kwargs):
                             print("### ig_call info | session refreshed (by sessionid)")
                     except Exception as e2:
                         print(f"### ig_call warn | session refresh failed: {e2}")
-                # jittered backoff
                 time.sleep(1 + attempt + random.random())
                 continue
             break
@@ -320,8 +300,8 @@ def _get_new_followers(cl: Client, diag: Optional[dict] = None) -> List[Dict]:
 
     me_username = os.getenv("IG_USERNAME") or _step("account_info", ig_call, cl, "account_info").username
     my_id = _step("user_id_from_username", ig_call, cl, "user_id_from_username", me_username)
-
     followers = _step("user_followers_v1", ig_call, cl, "user_followers_v1", my_id, amount=200)
+
     try:
         typ = type(followers).__name__
         if diag is not None: diag["followers_type"] = typ
@@ -332,7 +312,7 @@ def _get_new_followers(cl: Client, diag: Optional[dict] = None) -> List[Dict]:
     if diag is not None:
         diag["current_count"] = len(current_ids)
 
-    # SEEN READ (safe)
+    # SEEN READ
     seen_read_t0 = time.time()
     seen = _load_seen_ids()
     seen_read_ms = round((time.time() - seen_read_t0) * 1000)
@@ -365,7 +345,7 @@ def _get_new_followers(cl: Client, diag: Optional[dict] = None) -> List[Dict]:
                 "full_name": getattr(u, "full_name", "") or ""
             })
 
-    # SEEN WRITE (safe)
+    # SEEN WRITE
     seen_write_t0 = time.time()
     _save_seen_ids(current_ids)
     seen_write_ms = round((time.time() - seen_write_t0) * 1000)
@@ -465,6 +445,54 @@ def whoami_ip():
 @app.get("/seen_status")
 def seen_status():
     return {"backend": LAST_SEEN_BACKEND, "last_error": LAST_SEEN_ERROR}
+
+# ---- NEW: Redis diagnostics ----
+@app.get("/redis_diag")
+def redis_diag():
+    if not r:
+        return {"configured": False, "message": "REDIS_URL not set or client failed to init"}
+    out = {"configured": True}
+    try:
+        out["ping"] = r.ping()
+    except Exception as e:
+        out["ping"] = False
+        out["ping_error"] = f"{e.__class__.__name__}: {e}"
+        return out
+    try:
+        r.set("autodmmer:diag_kv", "ok", ex=60)
+        out["kv_set_get"] = r.get("autodmmer:diag_kv")
+    except Exception as e:
+        out["kv_error"] = f"{e.__class__.__name__}: {e}"
+    try:
+        r.sadd("autodmmer:diag_set", "1", "2")
+        out["set_members"] = list(r.smembers("autodmmer:diag_set"))
+    except Exception as e:
+        out["set_error"] = f"{e.__class__.__name__}: {e}"
+    return out
+
+@app.get("/seen_dump")
+def seen_dump(limit: int = 50):
+    vals = sorted(list(_load_seen_ids()))
+    return {"backend": LAST_SEEN_BACKEND, "count": len(vals), "sample": vals[:max(0, min(limit, 200))], "last_error": LAST_SEEN_ERROR}
+
+@app.post("/seen_reset")
+def seen_reset(confirm: int = 0):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="add ?confirm=1 to really clear seen set")
+    if r:
+        try:
+            r.delete(SEEN_KEY)
+            _set_seen_meta("redis")
+            return {"ok": True, "backend": "redis"}
+        except Exception as e:
+            _set_seen_meta("redis", e)
+    try:
+        if os.path.exists(SEEN_FILE):
+            os.remove(SEEN_FILE)
+        _set_seen_meta("file")
+        return {"ok": True, "backend": "file"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"seen_reset_failed: {e}")
 
 @app.get("/debug_followers_keys")
 def debug_followers_keys(limit: int = 5):
@@ -579,9 +607,6 @@ class ProcessFollowersBodyIn(BaseModel):
 
 @app.post("/process_new_followers")
 def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None, verbose: bool = False):
-    """
-    POST /process_new_followers?verbose=1
-    """
     diag = {} if verbose else None
     try:
         if payload is None:
