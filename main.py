@@ -14,7 +14,7 @@ import requests
 
 app = FastAPI(title="AutoDMmer API")
 
-# ---------- Optional Redis (persistent "seen" + settings) ----------
+# ---------- Optional Redis (persistent "seen" + settings + session override) ----------
 try:
     import redis  # optional
     REDIS_URL = os.getenv("REDIS_URL")
@@ -27,6 +27,9 @@ SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")  # fallback (ephe
 
 SETTINGS_KEY = os.getenv("SETTINGS_KEY", "ig_settings_json")
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "/tmp/ig_settings.json")
+
+SESSION_OVERRIDE_KEY = os.getenv("SESSION_OVERRIDE_KEY", "ig_sessionid_runtime")
+SESSION_FILE = os.getenv("SESSION_FILE", "/tmp/ig_sessionid.txt")
 
 # ---------- Helpers: persist "seen followers" ----------
 def _load_seen_ids() -> set:
@@ -74,6 +77,30 @@ def _save_ig_settings(settings: dict):
     except Exception:
         pass
 
+# ---------- Session override storage ----------
+def _load_session_override() -> Optional[str]:
+    try:
+        if r:
+            val = r.get(SESSION_OVERRIDE_KEY)
+            if val:
+                return val.strip()
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, "r") as f:
+                return f.read().strip()
+    except Exception:
+        return None
+    return None
+
+def _save_session_override(sessionid: str):
+    try:
+        if r:
+            r.set(SESSION_OVERRIDE_KEY, sessionid.strip())
+        else:
+            with open(SESSION_FILE, "w") as f:
+                f.write(sessionid.strip())
+    except Exception:
+        pass
+
 # ---------- (Optional) IP-probe, handig voor debugging proxy ----------
 def _probe_public_ip(proxy_url: Optional[str]) -> dict:
     try:
@@ -85,36 +112,42 @@ def _probe_public_ip(proxy_url: Optional[str]) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- Auth / login met proxy + persistente settings ----------
+# ---------- Auth / login met proxy + persistente settings + session override ----------
 def login_client() -> Client:
     """
-    Login via session-id of username/password.
-    - Gebruikt IG_PROXY_URL als proxy
-    - Laadt en bewaart instagrapi settings (device, cookies)
+    Login volgorde:
+      1) runtime session override (POST /set_sessionid)
+      2) IG_SESSION_ID (env)
+      3) IG_USERNAME + IG_PASSWORD
+    Met:
+      - IG_PROXY_URL proxy op alle requests
+      - Persistente settings (device, cookies) om challenges te verminderen
     """
     IG_USERNAME = os.getenv("IG_USERNAME")
     IG_PASSWORD = os.getenv("IG_PASSWORD")
     IG_SESSION_ID = os.getenv("IG_SESSION_ID")
-    IG_PROXY_URL = os.getenv("IG_PROXY_URL")  # bv. http://user:pass@host:port of socks5h://user:pass@host:port
+    IG_PROXY_URL = os.getenv("IG_PROXY_URL")  # bv. http://user:pass@host:port of socks5h://...
 
     cl = Client()
 
-    # 1) Proxy zetten (zo vroeg mogelijk)
+    # 1) Proxy vroeg zetten
     if IG_PROXY_URL:
         cl.set_proxy(IG_PROXY_URL)
 
-    # 2) Bestaande settings laden (device ids e.d.)
+    # 2) Settings laden (device-id e.d.)
     settings = _load_ig_settings()
     if settings:
         try:
             cl.set_settings(settings)
         except Exception:
-            # als oude settings corrupt zijn, negeren en vers beginnen
             pass
 
-    # 3) Probeer inloggen
+    # 3) Login
+    runtime_session = _load_session_override()
     try:
-        if IG_SESSION_ID:
+        if runtime_session:
+            cl.login_by_sessionid(runtime_session)
+        elif IG_SESSION_ID:
             cl.login_by_sessionid(IG_SESSION_ID)
         elif IG_USERNAME and IG_PASSWORD:
             cl.login(IG_USERNAME, IG_PASSWORD)
@@ -123,7 +156,7 @@ def login_client() -> Client:
     except Exception as e:
         raise HTTPException(status_code=500, detail="login_failed: {}".format(e))
 
-    # 4) Succesvolle login → settings bewaren
+    # 4) Succes → settings bewaren
     try:
         _save_ig_settings(cl.get_settings())
     except Exception:
@@ -177,12 +210,15 @@ class SendIfNoHistoryBody(BaseModel):
     username: str
     message: str
 
+class SessionBody(BaseModel):
+    sessionid: str
+
 # ---------- Startup logging ----------
 @app.on_event("startup")
 def _startup_log():
     try:
         print("### STARTUP: main.py loaded")
-        print("### STARTUP: session set? {} | username set? {}".format(bool(os.getenv("IG_SESSION_ID")), bool(os.getenv("IG_USERNAME"))))
+        print("### STARTUP: session(env) set? {} | username set? {}".format(bool(os.getenv("IG_SESSION_ID")), bool(os.getenv("IG_USERNAME"))))
         print("### STARTUP: proxy set? {}".format(bool(os.getenv("IG_PROXY_URL"))))
         ip_probe = _probe_public_ip(os.getenv("IG_PROXY_URL"))
         print("### STARTUP: egress IP probe = {}".format(ip_probe))
@@ -204,15 +240,35 @@ def ping():
 def list_routes():
     return {"routes": [{"path": r.path, "methods": list(getattr(r, "methods", []))} for r in app.routes]}
 
+@app.get("/proxy_info")
+def proxy_info():
+    IG_PROXY_URL = os.getenv("IG_PROXY_URL") or ""
+    return {
+        "env_proxy_set": bool(IG_PROXY_URL),
+        "env_proxy_scheme": IG_PROXY_URL.split("://")[0] if "://" in IG_PROXY_URL else None,
+        "whoami": _probe_public_ip(None),
+        "whoami_via_proxy": _probe_public_ip(IG_PROXY_URL) if IG_PROXY_URL else None
+    }
+
 @app.get("/debug_login")
 def debug_login():
     cl = login_client()
     me = cl.account_info()
     return {"ok": True, "username": me.username, "pk": me.pk, "full_name": getattr(me, "full_name", "")}
 
+@app.post("/set_sessionid")
+def set_sessionid(body: SessionBody):
+    """
+    Zet een runtime sessionid (bewaard in Redis of /tmp). Overschrijft env IG_SESSION_ID.
+    """
+    sid = body.sessionid.strip()
+    if not sid or len(sid) < 20:
+        raise HTTPException(status_code=400, detail="sessionid lijkt ongeldig")
+    _save_session_override(sid)
+    return {"ok": True}
+
 @app.get("/whoami_ip")
 def whoami_ip():
-    """Check je publieke IP, met of zonder proxy (voor debugging)."""
     direct = _probe_public_ip(None)
     via_proxy = _probe_public_ip(os.getenv("IG_PROXY_URL"))
     return {"direct": direct, "via_proxy": via_proxy}
@@ -296,18 +352,6 @@ def thread_by_participants(usernames: str):
         raise HTTPException(status_code=500, detail="thread_by_participants_failed: {}".format(e))
 
 # ---------- Endpoints die n8n aanroept ----------
-class ProcessFollowersBody(BaseModel):
-    time_check: bool = False
-    start_hour: int = 0
-    start_minute: int = 0
-    end_hour: int = 23
-    end_minute: int = 59
-    timezone: str = "UTC"
-
-class SendIfNoHistoryBody(BaseModel):
-    username: str
-    message: str
-
 @app.post("/process_new_followers")
 def process_new_followers(payload: ProcessFollowersBody):
     if payload.time_check:
