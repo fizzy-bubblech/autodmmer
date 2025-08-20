@@ -1,361 +1,100 @@
-# main.py
-import os, json, traceback, time, random
-from typing import List, Dict, Optional, Iterable, Tuple
-from datetime import datetime, time as dtime
-from zoneinfo import ZoneInfo
-
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Body, Query
 from pydantic import BaseModel
-from instagrapi import Client
-import requests
+from typing import Optional, List, Dict
+from datetime import datetime, time as dtime, timedelta
+from zoneinfo import ZoneInfo
+import os, json, time, uuid
 
-app = FastAPI(title="AutoDMmer API")
-
-# ---------- Optional Redis ----------
+# ---- Optional Redis ----
 try:
-    import redis  # optional
+    import redis  # type: ignore
     REDIS_URL = os.getenv("REDIS_URL")
     r = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 except Exception:
     r = None
 
-SEEN_KEY = os.getenv("SEEN_KEY", "ig_seen_followers")
-SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")
-SETTINGS_KEY = os.getenv("SETTINGS_KEY", "ig_settings_json")
-SETTINGS_FILE = os.getenv("SETTINGS_FILE", "/tmp/ig_settings.json")
-SESSION_OVERRIDE_KEY = os.getenv("SESSION_OVERRIDE_KEY", "ig_sessionid_runtime")
-SESSION_FILE = os.getenv("SESSION_FILE", "/tmp/ig_sessionid.txt")
+from instagrapi import Client
 
-# --- Telemetry over seen store backend ---
-LAST_SEEN_BACKEND = "unknown"  # "redis" | "file" | "unknown"
-LAST_SEEN_ERROR: Optional[str] = None
+app = FastAPI()
 
-def _set_seen_meta(backend: str, err: Optional[Exception] = None):
-    global LAST_SEEN_BACKEND, LAST_SEEN_ERROR
-    LAST_SEEN_BACKEND = backend
-    LAST_SEEN_ERROR = None if err is None else f"{e.__class__.__name__}: {e}" if (e:=err) else None
+# ---------- Config / Storage ----------
+SEEN_KEY          = os.getenv("SEEN_KEY", "ig_seen_followers")
+SEEN_FILE         = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")
 
-# ---------- Global error wrapper: altijd JSON ----------
-@app.middleware("http")
-async def json_errors(request, call_next):
+DM_SENT_PREFIX    = os.getenv("DM_SENT_PREFIX", "ig_dm_sent")   # ttl-keys per username
+DM_SENT_FILE      = os.getenv("DM_SENT_FILE", "/tmp/dm_sent.json")
+
+IG_USERNAME       = os.getenv("IG_USERNAME", "")                # VERPLICHT voor follower-polling
+IG_SESSION_ID     = os.getenv("IG_SESSION_ID", "")
+IG_PROXY_URL      = os.getenv("IG_PROXY_URL", "")
+IG_SETTINGS_FILE  = os.getenv("IG_SETTINGS_FILE", "/tmp/ig_settings.json")
+
+CLIENT: Optional[Client] = None
+LAST_LOGIN_TS: float = 0.0
+LOGIN_TTL_SEC = 60 * 20  # reinit client na ~20 minuten
+
+# ---------- Small utils ----------
+def _load_json_file(path: str, default):
     try:
-        return await call_next(request)
-    except HTTPException as he:
-        return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"detail": f"unhandled_error: {e.__class__.__name__}"})
-
-# ---------- Seen helpers ----------
-def _load_seen_ids() -> set:
-    # Redis
-    if r:
-        try:
-            vals = r.smembers(SEEN_KEY) or []
-            out = set(map(int, vals))
-            _set_seen_meta("redis")
-            return out
-        except Exception as e:
-            print("### SEEN redis read failed:", repr(e))
-            _set_seen_meta("redis", e)
-    # File fallback
-    try:
-        if os.path.exists(SEEN_FILE):
-            with open(SEEN_FILE, "r") as f:
-                out = set(json.load(f))
-        else:
-            out = set()
-        _set_seen_meta("file")
-        return out
-    except Exception as e:
-        print("### SEEN file read failed:", repr(e))
-        _set_seen_meta("file", e)
-        return set()
-
-def _save_seen_ids(ids: set):
-    # Redis
-    if r:
-        try:
-            pipe = r.pipeline()
-            for i in ids:
-                pipe.sadd(SEEN_KEY, int(i))
-            pipe.execute()
-            _set_seen_meta("redis")
-            return
-        except Exception as e:
-            print("### SEEN redis write failed:", repr(e))
-            _set_seen_meta("redis", e)
-    # File fallback
-    try:
-        with open(SEEN_FILE, "w") as f:
-            json.dump(sorted(list(ids)), f)
-        _set_seen_meta("file")
-    except Exception as e:
-        print("### SEEN file write failed:", repr(e))
-        _set_seen_meta("file", e)
-
-# ---------- IG settings persist ----------
-def _load_ig_settings() -> Optional[dict]:
-    try:
-        if r:
-            try:
-                raw = r.get(SETTINGS_KEY)
-                if raw:
-                    return json.loads(raw)
-            except Exception as e:
-                print("### SETTINGS redis read failed:", repr(e))
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "r") as f:
+        if os.path.exists(path):
+            with open(path, "r") as f:
                 return json.load(f)
     except Exception:
-        return None
-    return None
+        pass
+    return default
 
-def _save_ig_settings(settings: dict):
+def _save_json_file(path: str, data) -> None:
     try:
-        if r:
-            try:
-                r.set(SETTINGS_KEY, json.dumps(settings))
-                return
-            except Exception as e:
-                print("### SETTINGS redis write failed:", repr(e))
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(settings, f)
+        with open(path, "w") as f:
+            json.dump(data, f)
     except Exception:
         pass
 
-# ---------- Session override ----------
-def _load_session_override() -> Optional[str]:
-    try:
-        if r:
-            try:
-                val = r.get(SESSION_OVERRIDE_KEY)
-                if val:
-                    return val.strip()
-            except Exception as e:
-                print("### SESSION redis read failed:", repr(e))
-        if os.path.exists(SESSION_FILE):
-            with open(SESSION_FILE, "r") as f:
-                return f.read().strip()
-    except Exception:
-        return None
-    return None
-
-def _save_session_override(sessionid: str):
-    try:
-        if r:
-            try:
-                r.set(SESSION_OVERRIDE_KEY, sessionid.strip())
-                return
-            except Exception as e:
-                print("### SESSION redis write failed:", repr(e))
-        with open(SESSION_FILE, "w") as f:
-            f.write(sessionid.strip())
-    except Exception:
-        pass
-
-# ---------- Utils ----------
-def _probe_public_ip(proxy_url: Optional[str]) -> dict:
-    try:
-        kw = {}
-        if proxy_url:
-            kw["proxies"] = {"http": proxy_url, "https": proxy_url}
-        resp = requests.get("https://api.ipify.org?format=json", timeout=8, **kw)
-        return {"ok": True, "ip": resp.json().get("ip")}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-def login_client() -> Client:
-    IG_USERNAME = os.getenv("IG_USERNAME")
-    IG_PASSWORD = os.getenv("IG_PASSWORD")
-    IG_SESSION_ID = os.getenv("IG_SESSION_ID")
-    IG_PROXY_URL = os.getenv("IG_PROXY_URL")
-
-    cl = Client()
-    try:
-        cl.timeout = 20
-        cl.request_timeout = 20
-    except Exception:
-        pass
-    if IG_PROXY_URL:
-        cl.set_proxy(IG_PROXY_URL)
-
-    settings = _load_ig_settings()
-    if settings:
+def _seen_load() -> set:
+    if r:
         try:
-            cl.set_settings(settings)
+            return set(map(int, r.smembers(SEEN_KEY) or []))
         except Exception:
             pass
+    data = _load_json_file(SEEN_FILE, [])
+    return set(map(int, data or []))
 
-    runtime_session = _load_session_override()
-    try:
-        if runtime_session:
-            cl.login_by_sessionid(runtime_session)
-        elif IG_SESSION_ID:
-            cl.login_by_sessionid(IG_SESSION_ID)
-        elif IG_USERNAME and IG_PASSWORD:
-            cl.login(IG_USERNAME, IG_PASSWORD)
-        else:
-            raise HTTPException(status_code=500, detail="Missing IG credentials: set IG_SESSION_ID or IG_USERNAME+IG_PASSWORD")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"login_failed: {e}")
+def _seen_save(all_ids: set) -> None:
+    if r:
+        pipe = r.pipeline()
+        for i in all_ids:
+            pipe.sadd(SEEN_KEY, int(i))
+        pipe.execute()
+    else:
+        _save_json_file(SEEN_FILE, sorted(list(map(int, all_ids))))
 
-    try:
-        _save_ig_settings(cl.get_settings())
-    except Exception:
-        pass
-    return cl
+def _dm_key(username: str) -> str:
+    return f"{DM_SENT_PREFIX}:{username.lower()}"
 
-# ---------- Robust IG-call wrapper ----------
-TRANSIENT_MARKERS = (
-    "connection closed by server",
-    "temporarily blocked",
-    "please wait a few minutes",
-    "timed out",
-    "read timed out",
-    "max retries exceeded",
-    "connection reset",
-)
-
-def ig_call(cl: Client, func_name: str, *args, **kwargs):
-    last_err = None
-    for attempt in range(3):
-        t0 = time.time()
+def _dm_was_sent(username: str) -> bool:
+    if r:
         try:
-            fn = getattr(cl, func_name)
-            res = fn(*args, **kwargs)
-            dt = round((time.time() - t0) * 1000)
-            print(f"### ig_call ok | {func_name} (attempt {attempt+1}) | {dt}ms | args={str(args)[:80]} kwargs={json.dumps(kwargs)[:120]}")
-            return res
-        except Exception as e:
-            dt = round((time.time() - t0) * 1000)
-            last_err = e
-            msg = str(e).lower()
-            print(f"### ig_call fail | {func_name} (attempt {attempt+1}) | {dt}ms | err={e.__class__.__name__}: {e}")
-            if any(m in msg for m in TRANSIENT_MARKERS):
-                if attempt == 0:
-                    try:
-                        sid = _load_session_override() or os.getenv("IG_SESSION_ID")
-                        if sid:
-                            cl.login_by_sessionid(sid.strip())
-                            print("### ig_call info | session refreshed (by sessionid)")
-                    except Exception as e2:
-                        print(f"### ig_call warn | session refresh failed: {e2}")
-                time.sleep(1 + attempt + random.random())
-                continue
-            break
-    raise last_err
-
-# ---------- Followers helpers ----------
-def _followers_iter(followers_obj) -> Iterable:
-    if isinstance(followers_obj, dict):
-        return followers_obj.values()
-    if isinstance(followers_obj, list):
-        return iter(followers_obj)
-    try:
-        return iter(followers_obj)
-    except TypeError:
-        return iter([])
-
-def _collect_current_ids_and_map(followers_obj) -> Tuple[set, Dict[int, object]]:
-    current_ids: set = set()
-    users_by_pk: Dict[int, object] = {}
-    for u in _followers_iter(followers_obj):
-        pk = None
-        for attr in ("pk", "id"):
-            v = getattr(u, attr, None)
-            if v is not None:
-                pk = v
-                break
-        try:
-            if pk is None:
-                continue
-            pk = int(pk)
-            current_ids.add(pk)
-            users_by_pk[pk] = u
+            return r.get(_dm_key(username)) is not None
         except Exception:
-            continue
-    return current_ids, users_by_pk
+            pass
+    data = _load_json_file(DM_SENT_FILE, {})
+    ts = data.get(username.lower())
+    if not ts:
+        return False
+    # geen TTL in file-fallback; beschouw als “reeds verstuurd”
+    return True
 
-def _get_new_followers(cl: Client, diag: Optional[dict] = None) -> List[Dict]:
-    if diag is not None: diag["steps"] = []
-
-    def _step(name, fn, *a, **kw):
-        t0 = time.time()
+def _dm_mark_sent(username: str, ttl_hours: int = 72) -> None:
+    if r:
         try:
-            out = fn(*a, **kw)
-            if diag is not None:
-                diag["steps"].append({"step": name, "ok": True, "ms": round((time.time()-t0)*1000)})
-            return out
-        except Exception as e:
-            if diag is not None:
-                diag["steps"].append({
-                    "step": name, "ok": False, "ms": round((time.time()-t0)*1000),
-                    "err_type": e.__class__.__name__, "err": str(e)[:300]
-                })
-            raise
-
-    me_username = os.getenv("IG_USERNAME") or _step("account_info", ig_call, cl, "account_info").username
-    my_id = _step("user_id_from_username", ig_call, cl, "user_id_from_username", me_username)
-    followers = _step("user_followers_v1", ig_call, cl, "user_followers_v1", my_id, amount=200)
-
-    try:
-        typ = type(followers).__name__
-        if diag is not None: diag["followers_type"] = typ
-    except Exception:
-        pass
-
-    current_ids, users_by_pk = _collect_current_ids_and_map(followers)
-    if diag is not None:
-        diag["current_count"] = len(current_ids)
-
-    # SEEN READ
-    seen_read_t0 = time.time()
-    seen = _load_seen_ids()
-    seen_read_ms = round((time.time() - seen_read_t0) * 1000)
-    if diag is not None:
-        diag["seen_backend_before"] = LAST_SEEN_BACKEND
-        diag["seen_error_before"] = LAST_SEEN_ERROR
-        diag["seen_count_before"] = len(seen)
-        diag["seen_read_ms"] = seen_read_ms
-
-    new_ids = current_ids - seen
-
-    new_followers: List[Dict] = []
-    for pk in new_ids:
-        u = users_by_pk.get(pk)
-        if u is None:
-            try:
-                ui = _step("user_info_enrich", ig_call, cl, "user_info", pk)
-                new_followers.append({
-                    "pk": int(pk),
-                    "username": getattr(ui, "username", None),
-                    "full_name": getattr(ui, "full_name", "") or ""
-                })
-            except Exception as e:
-                print("### WARN enrich follower", pk, "->", repr(e))
-                new_followers.append({"pk": int(pk), "username": None, "full_name": ""})
-        else:
-            new_followers.append({
-                "pk": int(pk),
-                "username": getattr(u, "username", None),
-                "full_name": getattr(u, "full_name", "") or ""
-            })
-
-    # SEEN WRITE
-    seen_write_t0 = time.time()
-    _save_seen_ids(current_ids)
-    seen_write_ms = round((time.time() - seen_write_t0) * 1000)
-    if diag is not None:
-        diag["seen_backend_after"] = LAST_SEEN_BACKEND
-        diag["seen_error_after"] = LAST_SEEN_ERROR
-        diag["seen_write_ms"] = seen_write_ms
-        diag["new_ids_count"] = len(new_ids)
-
-    return new_followers
+            r.setex(_dm_key(username), ttl_hours * 3600, "1")
+            return
+        except Exception:
+            pass
+    # fallback: append in file dictionary (zonder TTL)
+    data = _load_json_file(DM_SENT_FILE, {})
+    data[username.lower()] = int(time.time())
+    _save_json_file(DM_SENT_FILE, data)
 
 def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, end_m: int) -> bool:
     try:
@@ -364,10 +103,86 @@ def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, en
         tz = ZoneInfo("UTC")
     now = datetime.now(tz).time()
     start = dtime(hour=start_h, minute=start_m)
-    end = dtime(hour=end_h, minute=end_m)
+    end   = dtime(hour=end_h, minute=end_m)
     if start <= end:
         return start <= now <= end
     return now >= start or now <= end
+
+# ---------- Login handling (no account_info calls) ----------
+def login_client(force: bool = False) -> Client:
+    """
+    Maakt of hergebruikt een ingelogde Client met sessionid/proxy.
+    Vermijdt account_info/current_user parsing (pinned_channels_info bug).
+    """
+    global CLIENT, LAST_LOGIN_TS
+    if CLIENT is not None and not force and (time.time() - LAST_LOGIN_TS) < LOGIN_TTL_SEC:
+        return CLIENT
+
+    if not IG_SESSION_ID:
+        raise HTTPException(status_code=500, detail="missing_env: IG_SESSION_ID")
+
+    cl = Client()
+    if IG_PROXY_URL:
+        cl.set_proxy(IG_PROXY_URL)
+
+    # Probeer settings te laden (stabiliseert device-fingerprint)
+    settings = _load_json_file(IG_SETTINGS_FILE, None)
+    if settings:
+        try:
+            cl.set_settings(settings)
+        except Exception:
+            pass
+
+    # Login-by-sessionid; vermijd extra verificatiecalls
+    try:
+        cl.login_by_sessionid(IG_SESSION_ID)
+    except Exception as e:
+        # Sommige instagrapi builds gooien KeyError('pinned_channels_info') bij parsing.
+        # Dat is meestal cosmetisch; probeer nog één keer “zacht” zonder te falen.
+        if "pinned_channels_info" not in str(e):
+            raise HTTPException(status_code=500, detail=f"login_failed: {e!s}")
+
+    # Settings opslaan (device/cookies)
+    try:
+        _save_json_file(IG_SETTINGS_FILE, cl.get_settings())
+    except Exception:
+        pass
+
+    CLIENT = cl
+    LAST_LOGIN_TS = time.time()
+    return cl
+
+# ---------- Followers ----------
+def fetch_followers(cl: Client) -> Dict[str, Dict]:
+    """
+    Haalt volgers op voor IG_USERNAME (verplicht via env).
+    Retourneert dict {pk_str: UserShort.to_dict()-achtig}
+    """
+    if not IG_USERNAME:
+        raise HTTPException(status_code=500, detail="missing_env: IG_USERNAME")
+
+    user_id = cl.user_id_from_username(IG_USERNAME)
+    followers = cl.user_followers_v1(user_id)  # dict[str(pk)] -> UserShort
+    return followers
+
+def compute_new_followers_snapshot(cl: Client) -> List[Dict]:
+    followers = fetch_followers(cl)
+    current_ids = set(map(int, followers.keys()))
+    seen = _seen_load()
+    new_ids = current_ids - seen
+
+    new_followers = []
+    for pk in new_ids:
+        u = followers[str(pk)]
+        new_followers.append({
+            "pk": int(pk),
+            "username": getattr(u, "username", ""),
+            "full_name": getattr(u, "full_name", "") or ""
+        })
+
+    # snapshot markeren (robust; bij geen nieuwe ids bewaren we tóch huidige stand)
+    _seen_save(current_ids)
+    return new_followers
 
 # ---------- Models ----------
 class ProcessFollowersBody(BaseModel):
@@ -381,295 +196,155 @@ class ProcessFollowersBody(BaseModel):
 class SendIfNoHistoryBody(BaseModel):
     username: str
     message: str
+    dedupe_hours: Optional[int] = 72
 
-class SessionBody(BaseModel):
-    sessionid: str
+class SendSimpleBody(BaseModel):
+    username: str
+    message: str
+    dedupe_hours: Optional[int] = 72
 
-# ---------- Startup logs ----------
-@app.on_event("startup")
-def _startup_log():
-    try:
-        print("### STARTUP: main.py loaded")
-        print(f"### STARTUP: session(env)? {bool(os.getenv('IG_SESSION_ID'))} | username set? {bool(os.getenv('IG_USERNAME'))}")
-        print(f"### STARTUP: proxy set? {bool(os.getenv('IG_PROXY_URL'))}")
-        ip_probe = _probe_public_ip(os.getenv("IG_PROXY_URL"))
-        print(f"### STARTUP: egress IP probe = {ip_probe}")
-        route_paths = [r.path for r in app.routes]
-        print(f"### STARTUP: routes = {route_paths}")
-    except Exception as e:
-        print(f"### STARTUP: route log failed: {e}")
-
-# ---------- Health & debug ----------
+# ---------- Routes ----------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "AutoDMmer API", "ts": datetime.utcnow().isoformat()}
+    return {"ok": True, "service": "autodmmer", "ts": datetime.utcnow().isoformat()}
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    try:
+        # lichte check; geen IG-call
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"health_failed: {e!s}")
 
 @app.get("/routes")
 def list_routes():
-    return {"routes": [{"path": r.path, "methods": list(getattr(r, "methods", []))} for r in app.routes]}
-
-@app.get("/proxy_info")
-def proxy_info():
-    IG_PROXY_URL = os.getenv("IG_PROXY_URL") or ""
-    return {
-        "env_proxy_set": bool(IG_PROXY_URL),
-        "env_proxy_scheme": IG_PROXY_URL.split("://")[0] if "://" in IG_PROXY_URL else None,
-        "whoami": _probe_public_ip(None),
-        "whoami_via_proxy": _probe_public_ip(IG_PROXY_URL) if IG_PROXY_URL else None
-    }
+    return {"routes": [{"path": r.path, "methods": list(r.methods)} for r in app.routes]}
 
 @app.get("/debug_login")
 def debug_login():
+    try:
+        cl = login_client(force=True)
+        # lichte check die zelden faalt: user_id lookup van eigen username
+        info = {}
+        if IG_USERNAME:
+            try:
+                uid = cl.user_id_from_username(IG_USERNAME)
+                info = {"username": IG_USERNAME, "user_id": str(uid)}
+            except Exception as ie:
+                info = {"username": IG_USERNAME, "error": f"user_id_lookup_failed: {ie!s}"}
+        return {"ok": True, **info}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"login_failed: {e!s}")
+
+@app.get("/debug_followers_keys")
+def debug_followers_keys():
     cl = login_client()
-    me = ig_call(cl, "account_info")
-    return {"ok": True, "username": me.username, "pk": str(me.pk), "full_name": getattr(me, "full_name", "")}
-
-@app.post("/set_sessionid")
-def set_sessionid(body: SessionBody):
-    sid = body.sessionid.strip()
-    if not sid or len(sid) < 20:
-        raise HTTPException(status_code=400, detail="sessionid lijkt ongeldig")
-    _save_session_override(sid)
-    return {"ok": True}
-
-@app.get("/whoami_ip")
-def whoami_ip():
-    direct = _probe_public_ip(None)
-    via_proxy = _probe_public_ip(os.getenv("IG_PROXY_URL"))
-    return {"direct": direct, "via_proxy": via_proxy}
+    followers = fetch_followers(cl)
+    sample = list(followers.items())[:3]
+    sample_pks = [pk for pk, _ in sample]
+    sample_usernames = [getattr(u, "username", "") for _, u in sample]
+    return {
+        "followers_type": type(followers).__name__,
+        "count": len(followers),
+        "sample_pks": sample_pks,
+        "sample_usernames": sample_usernames
+    }
 
 @app.get("/seen_status")
 def seen_status():
-    return {"backend": LAST_SEEN_BACKEND, "last_error": LAST_SEEN_ERROR}
+    backend = "redis" if r else "file"
+    return {"backend": backend, "count": len(_seen_load())}
 
-# ---- NEW: Redis diagnostics ----
-@app.get("/redis_diag")
-def redis_diag():
-    if not r:
-        return {"configured": False, "message": "REDIS_URL not set or client failed to init"}
-    out = {"configured": True}
-    try:
-        out["ping"] = r.ping()
-    except Exception as e:
-        out["ping"] = False
-        out["ping_error"] = f"{e.__class__.__name__}: {e}"
-        return out
-    try:
-        r.set("autodmmer:diag_kv", "ok", ex=60)
-        out["kv_set_get"] = r.get("autodmmer:diag_kv")
-    except Exception as e:
-        out["kv_error"] = f"{e.__class__.__name__}: {e}"
-    try:
-        r.sadd("autodmmer:diag_set", "1", "2")
-        out["set_members"] = list(r.smembers("autodmmer:diag_set"))
-    except Exception as e:
-        out["set_error"] = f"{e.__class__.__name__}: {e}"
-    return out
-
-@app.get("/seen_dump")
-def seen_dump(limit: int = 50):
-    vals = sorted(list(_load_seen_ids()))
-    return {"backend": LAST_SEEN_BACKEND, "count": len(vals), "sample": vals[:max(0, min(limit, 200))], "last_error": LAST_SEEN_ERROR}
-
-@app.post("/seen_reset")
-def seen_reset(confirm: int = 0):
-    if not confirm:
-        raise HTTPException(status_code=400, detail="add ?confirm=1 to really clear seen set")
-    if r:
-        try:
-            r.delete(SEEN_KEY)
-            _set_seen_meta("redis")
-            return {"ok": True, "backend": "redis"}
-        except Exception as e:
-            _set_seen_meta("redis", e)
-    try:
-        if os.path.exists(SEEN_FILE):
-            os.remove(SEEN_FILE)
-        _set_seen_meta("file")
-        return {"ok": True, "backend": "file"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"seen_reset_failed: {e}")
-
-@app.get("/debug_followers_keys")
-def debug_followers_keys(limit: int = 5):
-    cl = login_client()
-    me_username = os.getenv("IG_USERNAME") or ig_call(cl, "account_info").username
-    my_id = ig_call(cl, "user_id_from_username", me_username)
-    followers = ig_call(cl, "user_followers_v1", my_id, amount=200)
-    info = {"followers_type": type(followers).__name__, "count": len(followers) if hasattr(followers, "__len__") else None}
-    if isinstance(followers, dict):
-        ks = list(followers.keys())[:limit]
-        info["sample_keys"] = ks
-        info["key_types"] = [type(k).__name__ for k in ks]
-    elif isinstance(followers, list):
-        sample = followers[:limit]
-        info["sample_pks"] = [getattr(u, "pk", None) for u in sample]
-        info["sample_usernames"] = [getattr(u, "username", None) for u in sample]
-    else:
-        info["repr"] = repr(followers)[:200]
-    return info
-
-# ---------- Threads & messages ----------
-def _serialize_thread(t) -> Dict:
-    return {
-        "id": t.id,
-        "pk": t.pk,
-        "users": [{"pk": u.pk, "username": u.username, "full_name": u.full_name} for u in (t.users or [])],
-        "last_message": (
-            {
-                "id": str(t.messages[0].id),
-                "user_id": t.messages[0].user_id,
-                "text": t.messages[0].text,
-                "timestamp": t.messages[0].timestamp.isoformat() if getattr(t.messages[0], "timestamp", None) else None,
-                "item_type": t.messages[0].item_type,
-            } if getattr(t, "messages", None) and len(t.messages) > 0 else None
-        ),
-    }
-
-def _serialize_message(m) -> Dict:
-    return {
-        "id": str(m.id),
-        "user_id": m.user_id,
-        "thread_id": m.thread_id,
-        "text": m.text,
-        "item_type": m.item_type,
-        "timestamp": m.timestamp.isoformat() if getattr(m, "timestamp", None) else None,
-        "reactions": getattr(m, "reactions", None),
-    }
-
-@app.get("/threads")
-def list_threads(
-    amount: int = 20,
-    selected_filter: str = Query(default="", description="Allowed: '', 'flagged', 'unread'"),
-    thread_message_limit: Optional[int] = None
-):
-    if selected_filter not in ("", "flagged", "unread"):
-        raise HTTPException(status_code=400, detail="selected_filter must be '', 'flagged', or 'unread'")
-    try:
-        cl = login_client()
-        kwargs = {"amount": amount}
-        if selected_filter:
-            kwargs["selected_filter"] = selected_filter
-        if thread_message_limit is not None:
-            kwargs["thread_message_limit"] = thread_message_limit
-        threads = ig_call(cl, "direct_threads", **kwargs)
-        return {"threads": [_serialize_thread(t) for t in threads], "count": len(threads)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"threads_failed: {e}")
-
-@app.get("/thread/{thread_id}")
-def get_thread(thread_id: str, amount: int = 20):
-    try:
-        cl = login_client()
-        t = ig_call(cl, "direct_thread", thread_id, amount=amount)
-        return {"thread": _serialize_thread(t), "messages": [_serialize_message(m) for m in (t.messages or [])]}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=404, detail=f"thread_failed: {e}")
-
-@app.get("/messages/{thread_id}")
-def list_messages(thread_id: str, amount: int = 20):
-    try:
-        cl = login_client()
-        msgs = ig_call(cl, "direct_messages", thread_id, amount=amount)
-        return {"messages": [_serialize_message(m) for m in msgs], "count": len(msgs)}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"messages_failed: {e}")
-
-@app.get("/thread_by_participants")
-def thread_by_participants(usernames: str):
-    try:
-        cl = login_client()
-        names = [u.strip() for u in usernames.split(",") if u.strip()]
-        user_ids = [ig_call(cl, "user_id_from_username", u) for u in names]
-        t = ig_call(cl, "direct_thread_by_participants", user_ids)
-        return {"thread": _serialize_thread(t)}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"thread_by_participants_failed: {e}")
-
-# ---------- n8n endpoints ----------
-class ProcessFollowersBodyIn(BaseModel):
-    time_check: bool = False
-    start_hour: int = 0
-    start_minute: int = 0
-    end_hour: int = 23
-    end_minute: int = 59
-    timezone: str = "UTC"
+@app.get("/dm_sent_status")
+def dm_sent_status(username: str):
+    return {"username": username, "sent_before": _dm_was_sent(username)}
 
 @app.post("/process_new_followers")
-def process_new_followers(payload: Optional[ProcessFollowersBodyIn] = None, verbose: bool = False):
-    diag = {} if verbose else None
+def process_new_followers(payload: ProcessFollowersBody, verbose: int = Query(default=0)):
+    diag = {"steps": []}
+    t0 = time.time()
     try:
-        if payload is None:
-            payload = ProcessFollowersBodyIn()
         if payload.time_check:
-            ok = _within_time_window(
-                payload.timezone,
-                payload.start_hour, payload.start_minute,
-                payload.end_hour, payload.end_minute
-            )
+            ok = _within_time_window(payload.timezone, payload.start_hour, payload.start_minute,
+                                     payload.end_hour, payload.end_minute)
             if not ok:
                 return {"new_followers": [], "new_count": 0, "reason": "outside_time_window", "diag": diag}
-        t0 = time.time()
+
         cl = login_client()
-        if diag is not None:
-            diag["login_ms"] = round((time.time() - t0) * 1000)
-        new_followers = _get_new_followers(cl, diag=diag)
+        t1 = time.time()
+        diag["steps"].append({"step": "login", "ms": int((t1 - t0) * 1000)})
+
+        new_followers = compute_new_followers_snapshot(cl)
+        t2 = time.time()
+        diag["steps"].append({"step": "compute_new_followers", "ms": int((t2 - t1) * 1000)})
+
         out = {"new_followers": new_followers, "new_count": len(new_followers)}
-        if diag is not None:
+        if verbose:
             out["diag"] = diag
         return out
-    except HTTPException as he:
-        if diag is not None:
-            return {"detail": he.detail, "diag": diag, "seen_status": {"backend": LAST_SEEN_BACKEND, "last_error": LAST_SEEN_ERROR}}
-        raise
     except Exception as e:
-        traceback.print_exc()
-        detail = f"process_failed: {e}"
-        out = {"detail": detail}
-        if diag is not None:
-            out["diag"] = diag
-        out["seen_status"] = {"backend": LAST_SEEN_BACKEND, "last_error": LAST_SEEN_ERROR}
-        return JSONResponse(status_code=500, content=out)
-
-class SendIfNoHistoryBody(BaseModel):
-    username: str
-    message: str
+        detail = f"process_failed: {e!s}"
+        if verbose:
+            return {"detail": detail, "diag": diag}
+        raise HTTPException(status_code=500, detail=detail)
 
 @app.post("/send_dm_if_no_history")
-def send_dm_if_no_history(payload: SendIfNoHistoryBody):
+def send_dm_if_no_history(
+    payload: SendIfNoHistoryBody,
+    skip_history: int = Query(default=0)  # 1 = sla inbox-check over (aanrader)
+):
+    """
+    Optioneel: sla inbox-history check over (skip_history=1) en dedupe via Redis TTL.
+    """
     cl = login_client()
+    username = payload.username.strip()
+    message  = payload.message
+    dedupe_h = int(payload.dedupe_hours or 72)
+
+    # Local dedupe eerst (voorkomt dubbele DM's zonder inbox te lezen)
+    if _dm_was_sent(username):
+        return {"sent": False, "reason": "already_sent_local"}
+
+    # Inbox-check (optioneel) – kan 500/‘login_required’ geven, dus guarded:
+    if not skip_history:
+        try:
+            threads = cl.direct_threads(amount=20)
+            # check uitsluitend op presence van participant
+            uid = cl.user_id_from_username(username)
+            if any(any(getattr(u, "pk", None) == uid for u in (t.users or [])) for t in threads):
+                return {"sent": False, "reason": "history_exists"}
+        except Exception as e:
+            # Ga niet stuk op inbox; log reden en ga door met sturen
+            pass
+
+    # Sturen
     try:
-        user_id = ig_call(cl, "user_id_from_username", payload.username)
+        uid = cl.user_id_from_username(username)
+        cl.direct_send(message, [int(uid)])
+        _dm_mark_sent(username, ttl_hours=dedupe_h)
+        return {"sent": True, "to": username}
     except Exception as e:
-        return {"sent": False, "reason": f"username_lookup_failed: {e}"}
+        return {"sent": False, "reason": f"send_failed: {e!s}"}
+
+@app.post("/send_dm_simple")
+def send_dm_simple(payload: SendSimpleBody):
+    """
+    Minimalistische DM-endpoint (geen inbox-check); gebruikt alleen lokale dedupe.
+    """
+    cl = login_client()
+    username = payload.username.strip()
+    message  = payload.message
+    dedupe_h = int(payload.dedupe_hours or 72)
+
+    if _dm_was_sent(username):
+        return {"sent": False, "reason": "already_sent_local"}
+
     try:
-        threads = ig_call(cl, "direct_threads", amount=50)
-        existing = None
-        for t in threads:
-            if any(getattr(u, "pk", None) == user_id for u in (t.users or [])):
-                existing = t
-                break
-        has_history = False
-        if existing:
-            try:
-                t_full = ig_call(cl, "direct_thread", existing.id, amount=1)
-                has_history = bool(getattr(t_full, "messages", None)) and len(t_full.messages) > 0
-            except Exception:
-                has_history = True
-        if has_history:
-            return {"sent": False, "reason": "history_exists"}
-        ig_call(cl, "direct_send", payload.message, [int(user_id)])
-        return {"sent": True, "to": payload.username}
+        uid = cl.user_id_from_username(username)
+        cl.direct_send(message, [int(uid)])
+        _dm_mark_sent(username, ttl_hours=dedupe_h)
+        return {"sent": True, "to": username}
     except Exception as e:
-        traceback.print_exc()
-        return {"sent": False, "reason": f"send_failed: {e}"}
+        return {"sent": False, "reason": f"send_failed: {e!s}"}
