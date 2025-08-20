@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
-import os, json, time, uuid, requests
+import os, json, time, uuid, requests, random
 
 # ---- Optional Redis ----
 try:
@@ -18,17 +18,25 @@ from instagrapi import Client
 app = FastAPI()
 
 # ---------- Config / Storage ----------
-SEEN_KEY          = os.getenv("SEEN_KEY", "ig_seen_followers")
-SEEN_FILE         = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")
+SEEN_KEY            = os.getenv("SEEN_KEY", "ig_seen_followers")
+SEEN_FILE           = os.getenv("SEEN_FILE", "/tmp/seen_followers.json")
 
-DM_SENT_PREFIX    = os.getenv("DM_SENT_PREFIX", "ig_dm_sent")   # ttl-keys per username
-DM_SENT_FILE      = os.getenv("DM_SENT_FILE", "/tmp/dm_sent.json")
+DM_SENT_PREFIX      = os.getenv("DM_SENT_PREFIX", "ig_dm_sent")   # ttl-keys per username
+DM_SENT_FILE        = os.getenv("DM_SENT_FILE", "/tmp/dm_sent.json")
 
-IG_USERNAME       = os.getenv("IG_USERNAME", "").strip()        # VERPLICHT voor follower-polling
-IG_SESSION_ID     = (os.getenv("IG_SESSION_ID") or "").strip()
-IG_PROXY_URL      = (os.getenv("IG_PROXY_URL") or "").strip()
-IG_SETTINGS_FILE  = os.getenv("IG_SETTINGS_FILE", "/tmp/ig_settings.json")
+IG_USERNAME         = (os.getenv("IG_USERNAME") or "").strip()    # VERPLICHT voor follower-polling
+IG_SESSION_ID       = (os.getenv("IG_SESSION_ID") or "").strip()
+IG_PROXY_URL        = (os.getenv("IG_PROXY_URL") or "").strip()
+IG_SETTINGS_FILE    = os.getenv("IG_SETTINGS_FILE", "/tmp/ig_settings.json")
 
+# NEW: Redis-persistente settings key (overleeft container restarts)
+IG_SETTINGS_REDIS_KEY = os.getenv("IG_SETTINGS_REDIS_KEY", "ig:settings")
+
+# NEW: Globale DM-rate-limit (sec) om 429 te temperen
+DM_GLOBAL_RATE_KEY  = os.getenv("DM_GLOBAL_RATE_KEY", "ig:dm_rate_gate")
+DM_RATE_SECONDS     = int(os.getenv("DM_RATE_SECONDS", "3"))  # 1 DM per 3s
+
+# Login re-init om de X tijd (insta sessies worden soms “moe”)
 CLIENT: Optional[Client] = None
 LAST_LOGIN_TS: float = 0.0
 LOGIN_TTL_SEC = 60 * 20  # reinit client na ~20 minuten
@@ -104,13 +112,34 @@ def _within_time_window(tz_name: str, start_h: int, start_m: int, end_h: int, en
         return start <= now <= end
     return now >= start or now <= end
 
-# ---------- Login handling (use provided session + settings; no account_info) ----------
+# --- IG settings persist via Redis ---
+def _load_ig_settings():
+    if r:
+        try:
+            raw = r.get(IG_SETTINGS_REDIS_KEY)
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+    return _load_json_file(IG_SETTINGS_FILE, None)
+
+def _save_ig_settings(settings: dict):
+    try:
+        if r:
+            r.set(IG_SETTINGS_REDIS_KEY, json.dumps(settings))
+        _save_json_file(IG_SETTINGS_FILE, settings)  # fallback
+    except Exception:
+        pass
+
+# ---------- Login handling (sessionid + settings + proxy) ----------
 def login_client(force: bool = False) -> Client:
     """
     Reuse/create a logged-in Client using sessionid + settings + proxy.
-    Avoids account_info/current_user to skip parser bugs.
+    Avoid calling endpoints die extra checks doen (zoals account_info).
+    Met retry + speciale handling voor pinned_channels_info.
     """
     global CLIENT, LAST_LOGIN_TS, IG_SESSION_ID
+
     if CLIENT is not None and not force and (time.time() - LAST_LOGIN_TS) < LOGIN_TTL_SEC:
         return CLIENT
 
@@ -121,39 +150,63 @@ def login_client(force: bool = False) -> Client:
     if IG_PROXY_URL:
         cl.set_proxy(IG_PROXY_URL)
 
-    settings = _load_json_file(IG_SETTINGS_FILE, None)
+    # settings inladen (Redis > file)
+    settings = _load_ig_settings()
     if settings:
         try:
             cl.set_settings(settings)
         except Exception:
+            # settings kunnen corrupt zijn — negeren; client maakt nieuwe
             pass
 
-    try:
-        cl.login_by_sessionid(IG_SESSION_ID)
-    except Exception as e:
-        # Sommige builds gooien KeyError('pinned_channels_info') of login_required zonder verdere info.
-        msg = str(e)
-        if "login_required" in msg.lower():
-            raise HTTPException(status_code=401, detail=f"login_required")
-        if "pinned_channels_info" not in msg:
-            raise HTTPException(status_code=500, detail=f"login_failed: {msg}")
-
-    try:
-        _save_json_file(IG_SETTINGS_FILE, cl.get_settings())
-    except Exception:
-        pass
-
-    CLIENT = cl
-    LAST_LOGIN_TS = time.time()
-    return cl
+    # zachte retry
+    attempts = 0
+    last_err = None
+    while attempts < 3:
+        attempts += 1
+        try:
+            cl.login_by_sessionid(IG_SESSION_ID)
+            # settings updaten + bewaren
+            try:
+                _save_ig_settings(cl.get_settings())
+            except Exception:
+                pass
+            CLIENT = cl
+            LAST_LOGIN_TS = time.time()
+            return cl
+        except Exception as e:
+            msg = str(e).lower()
+            last_err = e
+            # Bekende parse-bug in sommige builds: niet fataal
+            if "pinned_channels_info" in msg:
+                try:
+                    _save_ig_settings(cl.get_settings())
+                except Exception:
+                    pass
+                CLIENT = cl
+                LAST_LOGIN_TS = time.time()
+                return cl
+            # Echte sessie stuk
+            if "login_required" in msg or "please wait a few minutes" in msg:
+                raise HTTPException(status_code=401, detail="login_required")
+            # Transient netwerk/proxy
+            time.sleep(0.8 + random.random()*0.7)
+    raise HTTPException(status_code=500, detail=f"login_failed: {last_err!s}")
 
 # ---------- Followers ----------
 def fetch_followers(cl: Client) -> Dict[str, Any]:
     if not IG_USERNAME:
         raise HTTPException(status_code=400, detail="missing_env: IG_USERNAME")
-    user_id = cl.user_id_from_username(IG_USERNAME)
-    followers = cl.user_followers_v1(user_id)  # dict[str(pk)] -> UserShort
-    return followers
+    uid = cl.user_id_from_username(IG_USERNAME)
+    last_err = None
+    for _ in range(3):
+        try:
+            # amount=0 -> alles (instagrapi pagineert intern)
+            return cl.user_followers_v1(uid, amount=0)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.6)
+    raise HTTPException(status_code=502, detail=f"followers_fetch_failed: {last_err!s}")
 
 def compute_new_followers_snapshot(cl: Client) -> List[Dict]:
     followers = fetch_followers(cl)
@@ -260,11 +313,13 @@ def debug_login():
 
 @app.get("/session_info")
 def session_info():
-    settings = _load_json_file(IG_SETTINGS_FILE, {})
+    settings = _load_ig_settings() or {}
     dev = settings.get("device_settings", {})
+    # session masken
+    sess_mask = bool(IG_SESSION_ID)
     return {
-        "has_session_env": bool(IG_SESSION_ID),
-        "has_settings_file": bool(settings),
+        "has_session_env": sess_mask,
+        "has_settings_persisted": bool(settings),
         "device_id": dev.get("device_id"),
         "phone_id": dev.get("phone_id"),
         "advertising_id": dev.get("advertising_id"),
@@ -272,12 +327,23 @@ def session_info():
         "last_login_age_sec": int(time.time() - LAST_LOGIN_TS) if LAST_LOGIN_TS else None
     }
 
-# ---------- Admin routes to push session+settings ----------
+@app.get("/diag")
+def diag():
+    return {
+        "ok": True,
+        "seen_backend": "redis" if r else "file",
+        "settings_store": "redis+file" if r else "file-only",
+        "dm_rate_seconds": DM_RATE_SECONDS,
+        "login_ttl_sec": LOGIN_TTL_SEC,
+        "ts": datetime.utcnow().isoformat()
+    }
+
+# ---------- Admin routes ----------
 @app.post("/admin/set_session_and_settings")
 def set_session_and_settings(payload: SessionSettingsBody):
     global IG_SESSION_ID, CLIENT, LAST_LOGIN_TS
     IG_SESSION_ID = payload.sessionid.strip()
-    _save_json_file(IG_SETTINGS_FILE, payload.settings)
+    _save_ig_settings(payload.settings)
     CLIENT = None
     LAST_LOGIN_TS = 0
     return {"ok": True, "note": "session + settings stored; next call will re-login"}
@@ -293,11 +359,24 @@ def set_sessionid(payload: SessionOnlyBody):
 @app.post("/admin/clear_settings")
 def clear_settings():
     try:
+        if r:
+            try:
+                r.delete(IG_SETTINGS_REDIS_KEY)
+            except Exception:
+                pass
         if os.path.exists(IG_SETTINGS_FILE):
             os.remove(IG_SETTINGS_FILE)
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/force_refresh")
+def force_refresh():
+    """Reset client cache; volgende call logt opnieuw in."""
+    global CLIENT, LAST_LOGIN_TS
+    CLIENT = None
+    LAST_LOGIN_TS = 0
+    return {"ok": True, "note": "client cleared"}
 
 # ---------- Followers ----------
 @app.get("/debug_followers_keys")
@@ -352,7 +431,48 @@ def process_new_followers(payload: ProcessFollowersBody, verbose: int = Query(de
             return {"detail": detail, "diag": diag}
         raise HTTPException(status_code=500, detail=detail)
 
-# ---------- DM sending ----------
+# ---------- DM helpers ----------
+def _global_rate_gate() -> bool:
+    """True = je mag sturen; False = nog even wachten."""
+    if not r:
+        # zonder Redis: soft-gate per proces
+        return True
+    try:
+        # Gebruik een TTL key; als hij bestaat, wacht
+        if r.get(DM_GLOBAL_RATE_KEY):
+            return False
+        r.setex(DM_GLOBAL_RATE_KEY, DM_RATE_SECONDS, "1")
+        return True
+    except Exception:
+        return True
+
+def _safe_send_dm(cl: Client, username: str, message: str) -> Dict[str, Any]:
+    if not username:
+        return {"sent": False, "reason": "missing_username"}
+
+    try:
+        uid = cl.user_id_from_username(username)
+    except Exception as e:
+        return {"sent": False, "reason": f"resolve_failed: {e!s}"}
+
+    last_err = None
+    for i in range(3):
+        if not _global_rate_gate():
+            time.sleep(0.8)
+        try:
+            cl.direct_send(message, [int(uid)])
+            return {"sent": True}
+        except Exception as e:
+            last_err = e
+            m = str(e).lower()
+            # Backoff voor rate/429/timeout
+            if "429" in m or "rate" in m or "timeout" in m or "temporarily blocked" in m:
+                time.sleep(2.0*(i+1))
+            else:
+                time.sleep(0.6)
+    return {"sent": False, "reason": f"send_failed: {last_err!s}"}
+
+# ---------- DM routes ----------
 @app.post("/send_dm_if_no_history")
 def send_dm_if_no_history(
     payload: SendIfNoHistoryBody,
@@ -373,16 +493,14 @@ def send_dm_if_no_history(
             if any(any(getattr(u, "pk", None) == uid for u in (t.users or [])) for t in threads):
                 return {"sent": False, "reason": "history_exists"}
         except Exception:
-            # inbox is flaky; don't hard-fail
+            # inbox is flaky; niet hard falen
             pass
 
-    try:
-        uid = cl.user_id_from_username(username)
-        cl.direct_send(message, [int(uid)])
+    res = _safe_send_dm(cl, username, message)
+    if res.get("sent"):
         _dm_mark_sent(username, ttl_hours=dedupe_h)
         return {"sent": True, "to": username}
-    except Exception as e:
-        return {"sent": False, "reason": f"send_failed: {e!s}"}
+    return {"sent": False, **res}
 
 @app.post("/send_dm_simple")
 def send_dm_simple(payload: SendSimpleBody):
@@ -394,10 +512,8 @@ def send_dm_simple(payload: SendSimpleBody):
     if _dm_was_sent(username):
         return {"sent": False, "reason": "already_sent_local"}
 
-    try:
-        uid = cl.user_id_from_username(username)
-        cl.direct_send(message, [int(uid)])
+    res = _safe_send_dm(cl, username, message)
+    if res.get("sent"):
         _dm_mark_sent(username, ttl_hours=dedupe_h)
         return {"sent": True, "to": username}
-    except Exception as e:
-        return {"sent": False, "reason": f"send_failed: {e!s}"}
+    return {"sent": False, **res}
